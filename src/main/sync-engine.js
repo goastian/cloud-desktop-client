@@ -18,12 +18,14 @@ class SyncEngine extends EventEmitter {
         this.paused = false;
         this.syncQueue = [];
         this.processing = false;
-        this.fileMap = new Map();
+        this.fileMap = new Map();        // Mapa: ruta local archivo → ID archivo servidor
+        this.folderMap = new Map();      // Mapa: ruta relativa carpeta → ID carpeta servidor
         this.workspaceId = null;
         this.folderId = null; // Set externally for multi-folder support
         
-        // Load persisted fileMap for this folder
+        // Load persisted maps for this folder
         this._loadFileMap();
+        this._loadFolderMap();
     }
 
     _getFileMapKey() {
@@ -51,6 +53,33 @@ class SyncEngine extends EventEmitter {
             this.store.set(this._getFileMapKey(), obj);
         } catch (error) {
             console.warn('Could not save fileMap:', error.message);
+        }
+    }
+
+    _getFolderMapKey() {
+        const folderHash = Buffer.from(this.syncFolder).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
+        return `folderMap_${folderHash}`;
+    }
+
+    _loadFolderMap() {
+        try {
+            const saved = this.store.get(this._getFolderMapKey(), null);
+            if (saved && typeof saved === 'object') {
+                this.folderMap = new Map(Object.entries(saved));
+                console.log(`Loaded ${this.folderMap.size} cached folder mappings`);
+            }
+        } catch (error) {
+            console.warn('Could not load folderMap:', error.message);
+            this.folderMap = new Map();
+        }
+    }
+
+    _saveFolderMap() {
+        try {
+            const obj = Object.fromEntries(this.folderMap);
+            this.store.set(this._getFolderMapKey(), obj);
+        } catch (error) {
+            console.warn('Could not save folderMap:', error.message);
         }
     }
 
@@ -188,8 +217,15 @@ class SyncEngine extends EventEmitter {
                 for (const serverFile of syncActions.download) {
                     try {
                         const fileName = this.getServerFileName(serverFile);
-                        const localPath = path.join(this.syncFolder, fileName);
-                        console.log(`      Descargando: ${fileName}`);
+                        // Usar la ruta relativa del servidor si está disponible
+                        const serverRelativePath = serverFile.serverRelativePath || fileName;
+                        const localPath = path.join(this.syncFolder, serverRelativePath);
+                        
+                        // Crear carpetas locales si no existen
+                        const localDir = path.dirname(localPath);
+                        await fs.mkdir(localDir, { recursive: true });
+                        
+                        console.log(`      Descargando: ${serverRelativePath}`);
                         await this.safeDownloadFile(serverFile, fileName, localPath);
                         this.fileMap.set(localPath, serverFile.id);
                     } catch (error) {
@@ -244,10 +280,14 @@ class SyncEngine extends EventEmitter {
                         const stats = await fs.stat(fullPath);
                         const hash = await this.calculateFileHash(fullPath);
                         
+                        const relativePath = path.relative(this.syncFolder, fullPath);
+                        const relativeDir = path.dirname(relativePath);
+                        
                         files.push({
                             name: entry.name,
                             path: fullPath,
-                            relativePath: path.relative(this.syncFolder, fullPath),
+                            relativePath: relativePath,
+                            relativeDir: relativeDir === '.' ? '' : relativeDir,
                             size: stats.size,
                             mtime: stats.mtime,
                             hash: hash
@@ -332,6 +372,7 @@ class SyncEngine extends EventEmitter {
     
     /**
      * Compara archivos locales con archivos del servidor y decide qué acciones tomar
+     * Considera la estructura de carpetas para una comparación correcta
      */
     async compareAndDecide(localFiles, serverFiles) {
         const actions = {
@@ -341,24 +382,39 @@ class SyncEngine extends EventEmitter {
             unchanged: []    // Archivos que están sincronizados
         };
         
-        // Crear mapa de archivos del servidor por nombre
+        // Obtener carpetas del servidor para construir rutas completas
+        const serverFolders = await this.getServerFolders();
+        const folderIdToPath = new Map();
+        
+        // Construir mapa de folder_id -> ruta
+        for (const folder of serverFolders) {
+            folderIdToPath.set(folder.id, this.buildFolderPath(folder, serverFolders));
+        }
+        
+        // Crear mapa de archivos del servidor por ruta relativa completa
         const serverFileMap = new Map();
         for (const serverFile of serverFiles) {
             const fileName = this.getServerFileName(serverFile);
             if (fileName && fileName !== 'unknown') {
-                serverFileMap.set(fileName.toLowerCase(), serverFile);
+                // Construir ruta relativa completa incluyendo carpeta
+                let relativePath = fileName;
+                if (serverFile.folder_id && folderIdToPath.has(serverFile.folder_id)) {
+                    const folderPath = folderIdToPath.get(serverFile.folder_id);
+                    relativePath = path.join(folderPath, fileName);
+                }
+                serverFileMap.set(relativePath.toLowerCase(), { ...serverFile, serverRelativePath: relativePath });
             }
         }
         
-        // Crear mapa de archivos locales por nombre
+        // Crear mapa de archivos locales por ruta relativa
         const localFileMap = new Map();
         for (const localFile of localFiles) {
-            localFileMap.set(localFile.name.toLowerCase(), localFile);
+            localFileMap.set(localFile.relativePath.toLowerCase(), localFile);
         }
         
         // Comparar archivos locales con servidor
         for (const localFile of localFiles) {
-            const serverFile = serverFileMap.get(localFile.name.toLowerCase());
+            const serverFile = serverFileMap.get(localFile.relativePath.toLowerCase());
             
             if (!serverFile) {
                 // Archivo existe localmente pero no en servidor -> SUBIR
@@ -366,8 +422,6 @@ class SyncEngine extends EventEmitter {
             } else {
                 // Archivo existe en ambos -> comparar
                 const localPath = localFile.path;
-                const serverModified = new Date(serverFile.updated_at);
-                const localModified = localFile.mtime;
                 
                 // Verificar si ya está en el fileMap (ya sincronizado antes)
                 if (this.fileMap.has(localPath) && this.fileMap.get(localPath) === serverFile.id) {
@@ -379,7 +433,7 @@ class SyncEngine extends EventEmitter {
                         actions.conflicts.push({ local: localFile, server: serverFile });
                     }
                 } else {
-                    // No está en fileMap, comparar por tamaño y fecha
+                    // No está en fileMap, comparar por tamaño
                     if (localFile.size === serverFile.size) {
                         // Mismo tamaño, asumir sincronizado
                         this.fileMap.set(localPath, serverFile.id);
@@ -393,19 +447,121 @@ class SyncEngine extends EventEmitter {
         }
         
         // Encontrar archivos que existen en servidor pero no localmente
-        for (const serverFile of serverFiles) {
-            const fileName = this.getServerFileName(serverFile);
-            if (fileName && !localFileMap.has(fileName.toLowerCase())) {
-                // Validación de seguridad
-                if (!fileName.includes('/') && !fileName.includes('\\')) {
-                    actions.download.push(serverFile);
-                }
+        for (const [serverRelativePath, serverFile] of serverFileMap) {
+            if (!localFileMap.has(serverRelativePath)) {
+                actions.download.push(serverFile);
             }
         }
         
         return actions;
     }
     
+    /**
+     * Construye la ruta completa de una carpeta basándose en su jerarquía de padres
+     */
+    buildFolderPath(folder, allFolders) {
+        const parts = [folder.name];
+        let current = folder;
+        
+        while (current.parent_id) {
+            const parent = allFolders.find(f => f.id === current.parent_id);
+            if (parent) {
+                parts.unshift(parent.name);
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        
+        return parts.join(path.sep);
+    }
+    
+    /**
+     * Obtiene o crea una carpeta en el servidor, retorna el ID de la carpeta
+     * @param {string} relativePath - Ruta relativa de la carpeta (ej: "docs/proyectos")
+     * @returns {number|null} - ID de la carpeta en el servidor o null si es raíz
+     */
+    async getOrCreateServerFolder(relativePath) {
+        if (!relativePath || relativePath === '.' || relativePath === '') {
+            return null; // Raíz, no necesita folder_id
+        }
+        
+        // Verificar si ya tenemos esta carpeta mapeada
+        if (this.folderMap.has(relativePath)) {
+            return this.folderMap.get(relativePath);
+        }
+        
+        // Dividir la ruta en partes para crear jerarquía
+        const parts = relativePath.split(path.sep).filter(p => p && p !== '.');
+        let parentId = null;
+        let currentPath = '';
+        
+        for (const folderName of parts) {
+            currentPath = currentPath ? path.join(currentPath, folderName) : folderName;
+            
+            // Verificar si esta parte ya existe en el mapa
+            if (this.folderMap.has(currentPath)) {
+                parentId = this.folderMap.get(currentPath);
+                continue;
+            }
+            
+            // Buscar si la carpeta ya existe en el servidor
+            try {
+                const response = await this.apiRequest('get', '/api/external/folders', {
+                    params: {
+                        workspace_id: this.workspaceId,
+                        parent_id: parentId || 'null'
+                    }
+                });
+                
+                const folders = response.data || [];
+                const existingFolder = folders.find(f => 
+                    f.name.toLowerCase() === folderName.toLowerCase()
+                );
+                
+                if (existingFolder) {
+                    parentId = existingFolder.id;
+                    this.folderMap.set(currentPath, existingFolder.id);
+                } else {
+                    // Crear la carpeta
+                    const createResponse = await this.apiRequest('post', '/api/external/folders', {
+                        name: folderName,
+                        workspace_id: this.workspaceId,
+                        parent_id: parentId
+                    });
+                    
+                    const newFolder = createResponse.data.folder || createResponse.data;
+                    parentId = newFolder.id;
+                    this.folderMap.set(currentPath, newFolder.id);
+                    console.log(`      📁 Carpeta creada: ${currentPath} (ID: ${newFolder.id})`);
+                }
+            } catch (error) {
+                console.error(`      ✗ Error creando carpeta ${currentPath}:`, error.message);
+                return null;
+            }
+        }
+        
+        this._saveFolderMap();
+        return parentId;
+    }
+    
+    /**
+     * Obtiene las carpetas del servidor para sincronización
+     */
+    async getServerFolders() {
+        try {
+            const response = await this.apiRequest('get', '/api/external/folders', {
+                params: { 
+                    workspace_id: this.workspaceId
+                }
+            });
+            return response.data || [];
+        } catch (error) {
+            console.error('Error obteniendo carpetas del servidor:', error.message);
+            return [];
+        }
+    }
+
     /**
      * Resuelve un conflicto entre archivo local y servidor
      * Por defecto: el más reciente gana
@@ -521,7 +677,7 @@ class SyncEngine extends EventEmitter {
         try {
             const lastSync = this.store.get('lastSyncTime', null);
             
-            // Use the external files endpoint
+            // Obtener archivos y carpetas del servidor
             const response = await this.apiRequest('get', '/api/external/files', {
                 params: { 
                     workspace_id: this.workspaceId
@@ -535,34 +691,42 @@ class SyncEngine extends EventEmitter {
                 return;
             }
             
-            console.log(`Found ${serverFiles.length} new/updated files`);
+            // Obtener carpetas para construir rutas
+            const serverFolders = await this.getServerFolders();
+            const folderIdToPath = new Map();
+            for (const folder of serverFolders) {
+                folderIdToPath.set(folder.id, this.buildFolderPath(folder, serverFolders));
+            }
+            
+            console.log(`Found ${serverFiles.length} files on server`);
             
             for (const file of serverFiles) {
-                // Obtener nombre del archivo - SIEMPRE usar original_name primero
-                let fileName = file.original_name || file.name;
+                const fileName = this.getServerFileName(file);
                 
-                // Si no tiene extensión, agregarla del mime_type
-                if (fileName && !path.extname(fileName) && file.mime_type) {
-                    const ext = this.getExtensionFromMimeType(file.mime_type);
-                    if (ext) {
-                        fileName = `${fileName}${ext}`;
-                    }
-                }
-                
-                if (!fileName || fileName.includes('/') || fileName.includes('\\')) {
-                    console.warn(`⚠️  Skipping unsafe file: ${fileName || 'unknown'}`);
+                if (!fileName || fileName === 'unknown') {
                     continue;
                 }
                 
-                const localPath = path.join(this.syncFolder, fileName);
+                // Construir ruta relativa completa incluyendo carpeta
+                let relativePath = fileName;
+                if (file.folder_id && folderIdToPath.has(file.folder_id)) {
+                    const folderPath = folderIdToPath.get(file.folder_id);
+                    relativePath = path.join(folderPath, fileName);
+                }
+                
+                const localPath = path.join(this.syncFolder, relativePath);
                 
                 // Verificar si ya está sincronizado
                 if (this.fileMap.has(localPath) && this.fileMap.get(localPath) === file.id) {
-                    console.log(`⏭️  Already synced: ${fileName}`);
+                    console.log(`⏭️  Already synced: ${relativePath}`);
                     continue;
                 }
                 
-                console.log(`⬇️  Syncing: ${fileName}`);
+                // Crear carpetas locales si no existen
+                const localDir = path.dirname(localPath);
+                await fs.mkdir(localDir, { recursive: true });
+                
+                console.log(`⬇️  Syncing: ${relativePath}`);
                 await this.safeDownloadFile(file, fileName, localPath);
                 this.fileMap.set(localPath, file.id);
             }
@@ -677,9 +841,24 @@ class SyncEngine extends EventEmitter {
             const FormData = require('form-data');
             const form = new FormData();
             
+            // Obtener la ruta relativa del archivo respecto a la carpeta de sincronización
+            const relativePath = path.relative(this.syncFolder, filePath);
+            const relativeDir = path.dirname(relativePath);
+            
+            // Obtener o crear la carpeta en el servidor si el archivo está en un subdirectorio
+            let folderId = null;
+            if (relativeDir && relativeDir !== '.') {
+                folderId = await this.getOrCreateServerFolder(relativeDir);
+            }
+            
             form.append('file', fileBuffer, fileName);
             form.append('workspace_id', this.workspaceId);
             form.append('name', fileName);
+            
+            // Agregar folder_id si el archivo está en un subdirectorio
+            if (folderId) {
+                form.append('folder_id', folderId);
+            }
 
             const fileId = this.fileMap.get(filePath);
             
