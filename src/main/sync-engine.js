@@ -105,7 +105,19 @@ class SyncEngine extends EventEmitter {
 
     async loadWorkspace() {
         try {
-            const response = await this.apiRequest('get', '/api/workspaces');
+            // First, debug the token to see if it's valid
+            try {
+                const debugResponse = await this.apiRequest('get', '/api/external/debug-token');
+                console.log('Token debug info:', JSON.stringify(debugResponse.data, null, 2));
+                
+                // Test POST with auth
+                const debugPostResponse = await this.apiRequest('post', '/api/external/debug-post', {});
+                console.log('POST debug info:', JSON.stringify(debugPostResponse.data, null, 2));
+            } catch (debugError) {
+                console.log('Debug endpoint error:', debugError.message);
+            }
+            
+            const response = await this.apiRequest('get', '/api/external/workspaces');
             const workspaces = response.data.data || response.data;
             
             const defaultWorkspace = workspaces.find(w => w.is_default) || workspaces[0];
@@ -130,12 +142,10 @@ class SyncEngine extends EventEmitter {
         console.log(`   Auth Token: ${this.authToken ? this.authToken.substring(0, 20) + '...' : 'NOT SET'}`);
         
         try {
-            // Use the files endpoint - this returns paginated results for root folder
-            // Note: In production, this only returns files in the root folder (folder_id = null)
-            const response = await this.apiRequest('get', '/api/files', {
+            // Use the external files endpoint for desktop clients
+            const response = await this.apiRequest('get', '/api/external/files', {
                 params: { 
-                    workspace_id: this.workspaceId,
-                    per_page: 100  // Get more files per page
+                    workspace_id: this.workspaceId
                 }
             });
             
@@ -264,7 +274,7 @@ class SyncEngine extends EventEmitter {
     async safeDownloadFile(file, fileName, localPath) {
         try {
             // IMPORTANTE: Para GET requests, pasar null como data y las opciones como config
-            const response = await this.apiRequest('get', `/api/files/${file.id}/download`, null, {
+            const response = await this.apiRequest('get', `/api/external/files/${file.id}/download`, null, {
                 responseType: 'arraybuffer'
             });
             
@@ -310,21 +320,14 @@ class SyncEngine extends EventEmitter {
         try {
             const lastSync = this.store.get('lastSyncTime', null);
             
-            // Use the files endpoint
-            const response = await this.apiRequest('get', '/api/files', {
+            // Use the external files endpoint
+            const response = await this.apiRequest('get', '/api/external/files', {
                 params: { 
-                    workspace_id: this.workspaceId,
-                    per_page: 100
+                    workspace_id: this.workspaceId
                 }
             });
             
-            // Handle both paginated and non-paginated responses
-            let serverFiles = [];
-            if (response.data && response.data.data) {
-                serverFiles = response.data.data;
-            } else if (Array.isArray(response.data)) {
-                serverFiles = response.data;
-            }
+            const serverFiles = response.data.data || response.data;
             
             if (!Array.isArray(serverFiles) || serverFiles.length === 0) {
                 console.log('No new changes on server');
@@ -480,11 +483,11 @@ class SyncEngine extends EventEmitter {
             const fileId = this.fileMap.get(filePath);
             
             if (fileId) {
-                const response = await this.apiRequest('post', `/api/files/${fileId}`, form, {
+                const response = await this.apiRequest('post', `/api/external/files/${fileId}`, form, {
                     headers: form.getHeaders()
                 });
             } else {
-                const response = await this.apiRequest('post', '/api/files', form, {
+                const response = await this.apiRequest('post', '/api/external/files', form, {
                     headers: form.getHeaders()
                 });
                 
@@ -506,7 +509,7 @@ class SyncEngine extends EventEmitter {
                 return;
             }
 
-            await this.apiRequest('delete', `/api/files/${fileId}`);
+            await this.apiRequest('delete', `/api/external/files/${fileId}`);
             this.fileMap.delete(filePath);
         } catch (error) {
             throw error;
@@ -516,15 +519,20 @@ class SyncEngine extends EventEmitter {
     async apiRequest(method, url, data = null, config = {}) {
         const fullUrl = `${this.serverUrl}${url}`;
         
+        // Build headers - ensure Authorization is always present and not overwritten
+        const headers = {
+            ...config.headers,  // First spread config headers (like Content-Type from FormData)
+            'Authorization': `Bearer ${this.authToken}`,  // Then set Authorization (overwrites if exists)
+            'Accept': 'application/json',
+        };
+        
+        // Build request config without spreading config.headers again
+        const { headers: configHeaders, ...restConfig } = config;
         const requestConfig = {
             method,
             url: fullUrl,
-            headers: {
-                'Authorization': `Bearer ${this.authToken}`,
-                'Accept': 'application/json',
-                ...config.headers
-            },
-            ...config
+            headers,
+            ...restConfig
         };
 
         // Handle params for GET requests (passed as data.params)
@@ -536,6 +544,7 @@ class SyncEngine extends EventEmitter {
 
         console.log(`API Request: ${method.toUpperCase()} ${fullUrl}`);
         console.log(`  Authorization: Bearer ${this.authToken ? this.authToken.substring(0, 30) + '...' : 'NOT SET'}`);
+        console.log(`  Headers:`, JSON.stringify(Object.keys(headers)));
         
         try {
             const response = await axios(requestConfig);
