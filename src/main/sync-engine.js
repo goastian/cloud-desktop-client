@@ -124,11 +124,17 @@ class SyncEngine extends EventEmitter {
 
     async safeInitialSync() {
         console.log('🔽 Starting safe initial sync...');
+        console.log(`   Server URL: ${this.serverUrl}`);
+        console.log(`   Workspace ID: ${this.workspaceId}`);
+        console.log(`   Sync Folder: ${this.syncFolder}`);
         
         try {
-            const response = await this.apiRequest('get', '/api/external/files', {
+            // Use the sync endpoint that returns all files without folder filter
+            const response = await this.apiRequest('get', '/api/external/sync/files', {
                 params: { workspace_id: this.workspaceId }
             });
+            
+            console.log('API Response status:', response.status);
             
             const serverFiles = response.data.data || response.data;
             
@@ -293,7 +299,8 @@ class SyncEngine extends EventEmitter {
         try {
             const lastSync = this.store.get('lastSyncTime', null);
             
-            const response = await this.apiRequest('get', '/api/external/files', {
+            // Use the sync endpoint that returns all files without folder filter
+            const response = await this.apiRequest('get', '/api/external/sync/files', {
                 params: { 
                     workspace_id: this.workspaceId,
                     updated_since: lastSync
@@ -497,16 +504,28 @@ class SyncEngine extends EventEmitter {
             url: fullUrl,
             headers: {
                 'Authorization': `Bearer ${this.authToken}`,
+                'Accept': 'application/json',
                 ...config.headers
             },
             ...config
         };
 
-        if (data) {
+        // Handle params for GET requests (passed as data.params)
+        if (method.toLowerCase() === 'get' && data && data.params) {
+            requestConfig.params = data.params;
+        } else if (data) {
             requestConfig.data = data;
         }
 
-        return await axios(requestConfig);
+        try {
+            const response = await axios(requestConfig);
+            return response;
+        } catch (error) {
+            console.error(`API Request failed: ${method.toUpperCase()} ${url}`);
+            console.error(`  Status: ${error.response?.status || 'N/A'}`);
+            console.error(`  Message: ${error.response?.data?.message || error.message}`);
+            throw error;
+        }
     }
 
     pause() {

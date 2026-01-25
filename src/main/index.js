@@ -197,20 +197,40 @@ function createTray() {
     return updateTrayMenu;
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
     createWindow();
     const updateTrayMenu = createTray();
     
     const isAuthenticated = store.get('authenticated', false);
     if (isAuthenticated) {
-        const syncFolder = store.get('syncFolder');
         const token = store.get('authToken');
         const serverUrl = environmentConfig.getServerUrl();
         
-        if (syncFolder && token) {
-            syncEngine = new SyncEngine(syncFolder, token, serverUrl, store);
-            syncEngine.on('status-changed', updateTrayMenu);
-            syncEngine.start();
+        // Start sync engines for all enabled sync folders
+        const syncFolders = syncFoldersManager.getSyncFolders();
+        for (const folder of syncFolders) {
+            if (folder.enabled && token) {
+                try {
+                    await startSyncForFolder(folder);
+                    console.log(`Started sync for folder: ${folder.name}`);
+                } catch (error) {
+                    console.error(`Failed to start sync for ${folder.name}:`, error.message);
+                }
+            }
+        }
+        
+        // Legacy support: if no sync folders but old syncFolder exists, migrate it
+        const legacySyncFolder = store.get('syncFolder');
+        if (syncFolders.length === 0 && legacySyncFolder && token) {
+            const newFolder = syncFoldersManager.addSyncFolder(legacySyncFolder, path.basename(legacySyncFolder));
+            if (newFolder) {
+                try {
+                    await startSyncForFolder(newFolder);
+                    console.log(`Migrated legacy sync folder: ${legacySyncFolder}`);
+                } catch (error) {
+                    console.error(`Failed to start sync for legacy folder:`, error.message);
+                }
+            }
         }
     }
 });
@@ -220,9 +240,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-    if (syncEngine) {
-        syncEngine.stop();
+    // Stop all sync engines
+    for (const [id, engine] of syncEngines) {
+        engine.stop();
     }
+    syncEngines.clear();
 });
 
 // IPC Handlers
@@ -358,23 +380,19 @@ ipcMain.handle('select-sync-folder', async () => {
 
 ipcMain.handle('start-sync', async () => {
     try {
-        const syncFolder = store.get('syncFolder');
         const token = store.get('authToken');
-        const serverUrl = environmentConfig.getServerUrl();
 
-        if (!syncFolder || !token) {
-            return { success: false, error: 'Missing configuration' };
+        if (!token) {
+            return { success: false, error: 'Not authenticated' };
         }
 
-        if (syncEngine) {
-            syncEngine.stop();
+        // Start sync for all enabled folders
+        const syncFolders = syncFoldersManager.getSyncFolders();
+        for (const folder of syncFolders) {
+            if (folder.enabled && !syncEngines.has(folder.id)) {
+                await startSyncForFolder(folder);
+            }
         }
-
-        syncEngine = new SyncEngine(syncFolder, token, serverUrl, store);
-        const updateTrayMenu = createTray();
-        syncEngine.on('status-changed', updateTrayMenu);
-        
-        await syncEngine.start();
         
         mainWindow.hide();
         
