@@ -83,6 +83,18 @@ class SyncEngine extends EventEmitter {
         }
     }
 
+    /**
+     * Limpia el cache de sincronización para forzar una re-sincronización completa
+     */
+    clearSyncCache() {
+        console.log('🗑️  Limpiando cache de sincronización...');
+        this.fileMap.clear();
+        this.folderMap.clear();
+        this.store.delete(this._getFileMapKey());
+        this.store.delete(this._getFolderMapKey());
+        console.log('✓ Cache limpiado. La próxima sincronización será completa.');
+    }
+
     async start() {
         console.log('Starting sync engine...');
         this.syncing = true;
@@ -323,11 +335,12 @@ class SyncEngine extends EventEmitter {
     }
     
     /**
-     * Obtiene todos los archivos del servidor
+     * Obtiene todos los archivos del servidor (incluyendo los de subcarpetas)
      */
     async getServerFiles() {
         try {
-            const response = await this.apiRequest('get', '/api/external/files', {
+            // Usar el endpoint /sync/files que devuelve TODOS los archivos sin filtrar por carpeta
+            const response = await this.apiRequest('get', '/api/external/sync/files', {
                 params: { 
                     workspace_id: this.workspaceId
                 }
@@ -677,8 +690,8 @@ class SyncEngine extends EventEmitter {
         try {
             const lastSync = this.store.get('lastSyncTime', null);
             
-            // Obtener archivos y carpetas del servidor
-            const response = await this.apiRequest('get', '/api/external/files', {
+            // Obtener TODOS los archivos del servidor (incluyendo subcarpetas)
+            const response = await this.apiRequest('get', '/api/external/sync/files', {
                 params: { 
                     workspace_id: this.workspaceId
                 }
@@ -848,25 +861,32 @@ class SyncEngine extends EventEmitter {
             // Obtener o crear la carpeta en el servidor si el archivo está en un subdirectorio
             let folderId = null;
             if (relativeDir && relativeDir !== '.') {
+                console.log(`      📂 Archivo en subdirectorio: ${relativeDir}`);
                 folderId = await this.getOrCreateServerFolder(relativeDir);
+                console.log(`      📂 folder_id obtenido: ${folderId}`);
             }
             
             form.append('file', fileBuffer, fileName);
-            form.append('workspace_id', this.workspaceId);
+            form.append('workspace_id', this.workspaceId.toString());
             form.append('name', fileName);
             
             // Agregar folder_id si el archivo está en un subdirectorio
             if (folderId) {
-                form.append('folder_id', folderId);
+                form.append('folder_id', folderId.toString());
+                console.log(`      ✓ Subiendo con folder_id: ${folderId}`);
+            } else {
+                console.log(`      ✓ Subiendo a la raíz (sin folder_id)`);
             }
 
             const fileId = this.fileMap.get(filePath);
             
             if (fileId) {
-                const response = await this.apiRequest('post', `/api/external/files/${fileId}`, form, {
+                // Usar PUT para actualizar archivos existentes
+                const response = await this.apiRequest('put', `/api/external/files/${fileId}`, form, {
                     headers: form.getHeaders()
                 });
             } else {
+                // Usar POST para crear nuevos archivos
                 const response = await this.apiRequest('post', '/api/external/files', form, {
                     headers: form.getHeaders()
                 });

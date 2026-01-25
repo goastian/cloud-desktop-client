@@ -722,6 +722,25 @@ ipcMain.handle('get-sync-status', async () => {
     return statuses;
 });
 
+ipcMain.handle('clear-sync-cache', async (event, folderId = null) => {
+    try {
+        if (folderId && syncEngines.has(folderId)) {
+            // Limpiar cache de una carpeta específica
+            const engine = syncEngines.get(folderId);
+            engine.clearSyncCache();
+            return { success: true, message: `Cache limpiado para carpeta ${folderId}` };
+        } else {
+            // Limpiar cache de todas las carpetas
+            for (const [id, engine] of syncEngines) {
+                engine.clearSyncCache();
+            }
+            return { success: true, message: 'Cache limpiado para todas las carpetas' };
+        }
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
 // ============================================
 // Settings Management IPC Handlers
 // ============================================
