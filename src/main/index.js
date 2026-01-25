@@ -11,7 +11,10 @@ const ActivityHistory = require('./activity-history');
 const OfflineCache = require('./offline-cache');
 const EnvironmentConfig = require('./environment-config');
 
-const store = new Conf();
+const store = new Conf({
+    projectName: 'astian-cloud',
+    projectSuffix: ''
+});
 let mainWindow = null;
 let tray = null;
 let syncEngines = new Map(); // Multiple sync engines for multiple folders
