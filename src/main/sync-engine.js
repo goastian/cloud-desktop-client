@@ -105,8 +105,8 @@ class SyncEngine extends EventEmitter {
 
     async loadWorkspace() {
         try {
-            const response = await this.apiRequest('get', '/api/external/workspaces');
-            const workspaces = response.data;
+            const response = await this.apiRequest('get', '/api/workspaces');
+            const workspaces = response.data.data || response.data;
             
             const defaultWorkspace = workspaces.find(w => w.is_default) || workspaces[0];
             
@@ -127,19 +127,30 @@ class SyncEngine extends EventEmitter {
         console.log(`   Server URL: ${this.serverUrl}`);
         console.log(`   Workspace ID: ${this.workspaceId}`);
         console.log(`   Sync Folder: ${this.syncFolder}`);
+        console.log(`   Auth Token: ${this.authToken ? this.authToken.substring(0, 20) + '...' : 'NOT SET'}`);
         
         try {
-            // Use the sync endpoint that returns all files without folder filter
-            const response = await this.apiRequest('get', '/api/external/sync/files', {
-                params: { workspace_id: this.workspaceId }
+            // Use the files endpoint - this returns paginated results for root folder
+            // Note: In production, this only returns files in the root folder (folder_id = null)
+            const response = await this.apiRequest('get', '/api/files', {
+                params: { 
+                    workspace_id: this.workspaceId,
+                    per_page: 100  // Get more files per page
+                }
             });
             
             console.log('API Response status:', response.status);
             
-            const serverFiles = response.data.data || response.data;
+            // Handle both paginated and non-paginated responses
+            let serverFiles = [];
+            if (response.data && response.data.data) {
+                serverFiles = response.data.data;
+            } else if (Array.isArray(response.data)) {
+                serverFiles = response.data;
+            }
             
-            if (!Array.isArray(serverFiles)) {
-                console.warn('No files to sync');
+            if (!Array.isArray(serverFiles) || serverFiles.length === 0) {
+                console.log('No files to sync from server');
                 return;
             }
             
@@ -253,7 +264,7 @@ class SyncEngine extends EventEmitter {
     async safeDownloadFile(file, fileName, localPath) {
         try {
             // IMPORTANTE: Para GET requests, pasar null como data y las opciones como config
-            const response = await this.apiRequest('get', `/api/external/files/${file.id}/download`, null, {
+            const response = await this.apiRequest('get', `/api/files/${file.id}/download`, null, {
                 responseType: 'arraybuffer'
             });
             
@@ -299,15 +310,21 @@ class SyncEngine extends EventEmitter {
         try {
             const lastSync = this.store.get('lastSyncTime', null);
             
-            // Use the sync endpoint that returns all files without folder filter
-            const response = await this.apiRequest('get', '/api/external/sync/files', {
+            // Use the files endpoint
+            const response = await this.apiRequest('get', '/api/files', {
                 params: { 
                     workspace_id: this.workspaceId,
-                    updated_since: lastSync
+                    per_page: 100
                 }
             });
             
-            const serverFiles = response.data.data || response.data;
+            // Handle both paginated and non-paginated responses
+            let serverFiles = [];
+            if (response.data && response.data.data) {
+                serverFiles = response.data.data;
+            } else if (Array.isArray(response.data)) {
+                serverFiles = response.data;
+            }
             
             if (!Array.isArray(serverFiles) || serverFiles.length === 0) {
                 console.log('No new changes on server');
@@ -463,11 +480,11 @@ class SyncEngine extends EventEmitter {
             const fileId = this.fileMap.get(filePath);
             
             if (fileId) {
-                const response = await this.apiRequest('post', `/api/external/files/${fileId}`, form, {
+                const response = await this.apiRequest('post', `/api/files/${fileId}`, form, {
                     headers: form.getHeaders()
                 });
             } else {
-                const response = await this.apiRequest('post', '/api/external/files', form, {
+                const response = await this.apiRequest('post', '/api/files', form, {
                     headers: form.getHeaders()
                 });
                 
@@ -489,7 +506,7 @@ class SyncEngine extends EventEmitter {
                 return;
             }
 
-            await this.apiRequest('delete', `/api/external/files/${fileId}`);
+            await this.apiRequest('delete', `/api/files/${fileId}`);
             this.fileMap.delete(filePath);
         } catch (error) {
             throw error;
@@ -517,6 +534,9 @@ class SyncEngine extends EventEmitter {
             requestConfig.data = data;
         }
 
+        console.log(`API Request: ${method.toUpperCase()} ${fullUrl}`);
+        console.log(`  Authorization: Bearer ${this.authToken ? this.authToken.substring(0, 30) + '...' : 'NOT SET'}`);
+        
         try {
             const response = await axios(requestConfig);
             return response;
@@ -524,6 +544,8 @@ class SyncEngine extends EventEmitter {
             console.error(`API Request failed: ${method.toUpperCase()} ${url}`);
             console.error(`  Status: ${error.response?.status || 'N/A'}`);
             console.error(`  Message: ${error.response?.data?.message || error.message}`);
+            console.error(`  Full URL: ${fullUrl}`);
+            console.error(`  Token present: ${!!this.authToken}`);
             throw error;
         }
     }
