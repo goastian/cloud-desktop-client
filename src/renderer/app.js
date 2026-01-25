@@ -280,15 +280,19 @@ function setupEventListeners() {
     });
     
     // Activity
-    document.getElementById('btnRefreshActivity').addEventListener('click', loadActivityHistory);
+    document.getElementById('btnRefreshActivity').addEventListener('click', async () => {
+        await loadActiveTransfers();
+        await loadActivityHistory();
+    });
     document.getElementById('activityFilter').addEventListener('change', loadActivityHistory);
     document.getElementById('btnClearActivity').addEventListener('click', async () => {
-        if (confirm('¿Limpiar todo el historial de actividad?')) {
+        if (confirm('¿Clear all activity history?')) {
             await ipcRenderer.invoke('clear-activity-history');
             loadActivityHistory();
         }
     });
     document.getElementById('btnExportActivity').addEventListener('click', exportActivityHistory);
+    document.getElementById('btnCancelAllTransfers').addEventListener('click', cancelAllTransfers);
 }
 
 function setupTabListeners() {
@@ -386,6 +390,9 @@ async function showDashboard() {
     
     // Load settings
     await loadSettings();
+    
+    // Load active transfers
+    await loadActiveTransfers();
     
     // Load activity history
     await loadActivityHistory();
@@ -1029,6 +1036,103 @@ function showDevControls(show) {
     }
 }
 
+// ============================================
+// Active Transfers Management
+// ============================================
+
+let activeTransfers = { inProgress: [], pending: [], all: [] };
+
+async function loadActiveTransfers() {
+    activeTransfers = await ipcRenderer.invoke('get-active-transfers');
+    renderActiveTransfers();
+}
+
+function renderActiveTransfers() {
+    const activeSection = document.getElementById('activeTransfersSection');
+    const pendingSection = document.getElementById('pendingTransfersSection');
+    const activeList = document.getElementById('activeTransfersList');
+    const pendingList = document.getElementById('pendingTransfersList');
+    const pendingCount = document.getElementById('pendingCount');
+    
+    // Show/hide sections based on content
+    if (activeTransfers.inProgress.length > 0) {
+        activeSection.style.display = 'block';
+        activeList.innerHTML = activeTransfers.inProgress.map(renderTransferItem).join('');
+    } else {
+        activeSection.style.display = 'none';
+    }
+    
+    if (activeTransfers.pending.length > 0) {
+        pendingSection.style.display = 'block';
+        pendingCount.textContent = activeTransfers.pending.length;
+        pendingList.innerHTML = activeTransfers.pending.map(renderTransferItem).join('');
+    } else {
+        pendingSection.style.display = 'none';
+    }
+}
+
+function renderTransferItem(transfer) {
+    const icon = transfer.type === 'upload' ? '⬆️' : '⬇️';
+    const statusClass = transfer.status === 'in_progress' ? 'in-progress' : 'pending';
+    const showProgress = transfer.status === 'in_progress';
+    
+    return `
+        <div class="transfer-item ${statusClass}" data-id="${transfer.id}">
+            <div class="transfer-icon">${icon}</div>
+            <div class="transfer-details">
+                <div class="transfer-name">${transfer.fileName || 'Unknown file'}</div>
+                <div class="transfer-info">
+                    ${transfer.size ? `<span>${formatBytes(transfer.size)}</span>` : ''}
+                    ${showProgress ? `
+                        <div class="transfer-progress-bar">
+                            <div class="transfer-progress-fill" style="width: ${transfer.progress || 0}%"></div>
+                        </div>
+                        <span class="transfer-progress-text">${Math.round(transfer.progress || 0)}%</span>
+                    ` : `<span>Waiting...</span>`}
+                </div>
+            </div>
+            <div class="transfer-actions">
+                <button onclick="cancelTransfer('${transfer.id}')" title="Cancel">✕</button>
+            </div>
+        </div>
+    `;
+}
+
+async function cancelTransfer(transferId) {
+    const result = await ipcRenderer.invoke('cancel-transfer', transferId);
+    if (result.success) {
+        await loadActiveTransfers();
+        await loadActivityHistory();
+    }
+}
+
+async function cancelAllTransfers() {
+    if (confirm('¿Cancel all active transfers?')) {
+        const result = await ipcRenderer.invoke('cancel-all-transfers');
+        if (result.success) {
+            await loadActiveTransfers();
+            await loadActivityHistory();
+        }
+    }
+}
+
+// Listen for transfer updates from main process
+ipcRenderer.on('transfers-updated', (event, transfers) => {
+    activeTransfers = transfers;
+    renderActiveTransfers();
+});
+
+ipcRenderer.on('transfer-progress', (event, transfer) => {
+    // Update specific transfer progress in UI
+    const transferEl = document.querySelector(`.transfer-item[data-id="${transfer.id}"]`);
+    if (transferEl) {
+        const progressFill = transferEl.querySelector('.transfer-progress-fill');
+        const progressText = transferEl.querySelector('.transfer-progress-text');
+        if (progressFill) progressFill.style.width = `${transfer.progress}%`;
+        if (progressText) progressText.textContent = `${Math.round(transfer.progress)}%`;
+    }
+});
+
 // Make functions globally available for onclick handlers
 window.removeSetupFolder = removeSetupFolder;
 window.addSyncFolder = addSyncFolder;
@@ -1038,3 +1142,5 @@ window.addBackupFolder = addBackupFolder;
 window.startBackup = startBackup;
 window.removeBackupFolder = removeBackupFolder;
 window.removeExclusionPattern = removeExclusionPattern;
+window.cancelTransfer = cancelTransfer;
+window.cancelAllTransfers = cancelAllTransfers;

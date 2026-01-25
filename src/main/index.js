@@ -662,7 +662,7 @@ async function startSyncForFolder(folder) {
         throw new Error('Not authenticated');
     }
     
-    const engine = new SyncEngine(folder.path, token, serverUrl, store);
+    const engine = new SyncEngine(folder.path, token, serverUrl, store, activityHistory);
     engine.folderId = folder.id;
     
     engine.on('status-changed', () => {
@@ -869,6 +869,32 @@ ipcMain.handle('clear-old-activity', async (event, days = 30) => {
 
 ipcMain.handle('export-activity-history', async () => {
     return activityHistory.exportHistory();
+});
+
+// Active Transfers IPC Handlers
+ipcMain.handle('get-active-transfers', async () => {
+    return activityHistory.getActiveTransfers();
+});
+
+ipcMain.handle('cancel-transfer', async (event, transferId) => {
+    return activityHistory.cancelTransfer(transferId);
+});
+
+ipcMain.handle('cancel-all-transfers', async () => {
+    return activityHistory.cancelAllTransfers();
+});
+
+// Forward transfer events to renderer
+activityHistory.on('transfers-updated', (transfers) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('transfers-updated', transfers);
+    }
+});
+
+activityHistory.on('transfer-progress', (transfer) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('transfer-progress', transfer);
+    }
 });
 
 // ============================================

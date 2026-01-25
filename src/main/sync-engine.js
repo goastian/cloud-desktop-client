@@ -7,12 +7,13 @@ const crypto = require('crypto');
 const { EventEmitter } = require('events');
 
 class SyncEngine extends EventEmitter {
-    constructor(syncFolder, authToken, serverUrl, store) {
+    constructor(syncFolder, authToken, serverUrl, store, activityHistory = null) {
         super();
         this.syncFolder = syncFolder;
         this.authToken = authToken;
         this.serverUrl = serverUrl;
         this.store = store;
+        this.activityHistory = activityHistory;
         this.watcher = null;
         this.syncing = false;
         this.paused = false;
@@ -908,11 +909,27 @@ class SyncEngine extends EventEmitter {
     }
 
     async uploadFile(filePath) {
+        let transfer = null;
+        const startTime = Date.now();
+        
         try {
             const stats = await fs.stat(filePath);
             if (!stats.isFile()) return;
 
             const fileName = path.basename(filePath);
+            
+            // Register active transfer
+            if (this.activityHistory) {
+                transfer = this.activityHistory.addActiveTransfer({
+                    type: 'upload',
+                    filePath,
+                    fileName,
+                    size: stats.size,
+                    folderId: this.folderId
+                });
+                this.activityHistory.startTransfer(transfer.id);
+            }
+            
             const fileBuffer = await fs.readFile(filePath);
             const FormData = require('form-data');
             const form = new FormData();
@@ -943,6 +960,11 @@ class SyncEngine extends EventEmitter {
 
             const fileId = this.fileMap.get(filePath);
             
+            // Update progress to 50% after preparing data
+            if (transfer && this.activityHistory) {
+                this.activityHistory.updateTransferProgress(transfer.id, 50);
+            }
+            
             if (fileId) {
                 // Usar PUT para actualizar archivos existentes
                 const response = await this.apiRequest('put', `/api/external/files/${fileId}`, form, {
@@ -958,7 +980,16 @@ class SyncEngine extends EventEmitter {
                     this.fileMap.set(filePath, response.data.id);
                 }
             }
+            
+            // Complete transfer successfully
+            if (transfer && this.activityHistory) {
+                this.activityHistory.completeTransfer(transfer.id, true);
+            }
         } catch (error) {
+            // Mark transfer as failed
+            if (transfer && this.activityHistory) {
+                this.activityHistory.completeTransfer(transfer.id, false, error.message);
+            }
             throw error;
         }
     }

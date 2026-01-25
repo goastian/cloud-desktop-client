@@ -11,6 +11,182 @@ class ActivityHistory extends EventEmitter {
         super();
         this.store = store;
         this.maxEntries = 1000; // Máximo de entradas en el historial
+        
+        // Transferencias activas (en progreso y pendientes)
+        this.activeTransfers = new Map(); // id -> transfer info
+        this.pendingQueue = []; // Cola de transferencias pendientes
+        this.abortControllers = new Map(); // id -> AbortController para cancelar
+    }
+
+    /**
+     * Add a transfer to the active queue
+     */
+    addActiveTransfer(transfer) {
+        const id = this.generateId();
+        const activeTransfer = {
+            id,
+            timestamp: new Date().toISOString(),
+            status: ActivityHistory.STATUS.PENDING,
+            progress: 0,
+            ...transfer
+        };
+        
+        this.activeTransfers.set(id, activeTransfer);
+        this.emit('transfer-added', activeTransfer);
+        this.emit('transfers-updated', this.getActiveTransfers());
+        
+        return activeTransfer;
+    }
+
+    /**
+     * Start a transfer (move from pending to in_progress)
+     */
+    startTransfer(transferId, abortController = null) {
+        const transfer = this.activeTransfers.get(transferId);
+        if (transfer) {
+            transfer.status = ActivityHistory.STATUS.IN_PROGRESS;
+            transfer.startedAt = new Date().toISOString();
+            
+            if (abortController) {
+                this.abortControllers.set(transferId, abortController);
+            }
+            
+            this.emit('transfer-started', transfer);
+            this.emit('transfers-updated', this.getActiveTransfers());
+        }
+        return transfer;
+    }
+
+    /**
+     * Update transfer progress
+     */
+    updateTransferProgress(transferId, progress, bytesTransferred = null) {
+        const transfer = this.activeTransfers.get(transferId);
+        if (transfer) {
+            transfer.progress = Math.min(100, Math.max(0, progress));
+            if (bytesTransferred !== null) {
+                transfer.bytesTransferred = bytesTransferred;
+            }
+            this.emit('transfer-progress', transfer);
+            this.emit('transfers-updated', this.getActiveTransfers());
+        }
+        return transfer;
+    }
+
+    /**
+     * Complete a transfer
+     */
+    completeTransfer(transferId, success = true, error = null) {
+        const transfer = this.activeTransfers.get(transferId);
+        if (transfer) {
+            transfer.status = success ? ActivityHistory.STATUS.COMPLETED : ActivityHistory.STATUS.FAILED;
+            transfer.completedAt = new Date().toISOString();
+            transfer.progress = success ? 100 : transfer.progress;
+            if (error) transfer.error = error;
+            
+            // Calculate duration
+            if (transfer.startedAt) {
+                transfer.duration = new Date(transfer.completedAt) - new Date(transfer.startedAt);
+            }
+            
+            // Move to history
+            this.addActivity({
+                type: transfer.type,
+                filePath: transfer.filePath,
+                fileName: transfer.fileName,
+                size: transfer.size,
+                folderId: transfer.folderId,
+                status: transfer.status,
+                error: transfer.error,
+                duration: transfer.duration
+            });
+            
+            // Remove from active
+            this.activeTransfers.delete(transferId);
+            this.abortControllers.delete(transferId);
+            
+            this.emit('transfer-completed', transfer);
+            this.emit('transfers-updated', this.getActiveTransfers());
+        }
+        return transfer;
+    }
+
+    /**
+     * Cancel a transfer
+     */
+    cancelTransfer(transferId) {
+        const transfer = this.activeTransfers.get(transferId);
+        if (transfer) {
+            // Abort if there's an abort controller
+            const controller = this.abortControllers.get(transferId);
+            if (controller) {
+                controller.abort();
+            }
+            
+            transfer.status = ActivityHistory.STATUS.CANCELLED;
+            transfer.completedAt = new Date().toISOString();
+            
+            // Log cancellation
+            this.addActivity({
+                type: transfer.type,
+                filePath: transfer.filePath,
+                fileName: transfer.fileName,
+                size: transfer.size,
+                folderId: transfer.folderId,
+                status: ActivityHistory.STATUS.CANCELLED,
+                message: 'Transferencia cancelada por el usuario'
+            });
+            
+            // Remove from active
+            this.activeTransfers.delete(transferId);
+            this.abortControllers.delete(transferId);
+            
+            this.emit('transfer-cancelled', transfer);
+            this.emit('transfers-updated', this.getActiveTransfers());
+            
+            return { success: true, transfer };
+        }
+        return { success: false, error: 'Transfer not found' };
+    }
+
+    /**
+     * Cancel all active transfers
+     */
+    cancelAllTransfers() {
+        const cancelled = [];
+        for (const [id, transfer] of this.activeTransfers) {
+            const result = this.cancelTransfer(id);
+            if (result.success) {
+                cancelled.push(transfer);
+            }
+        }
+        return { success: true, cancelled: cancelled.length };
+    }
+
+    /**
+     * Get all active transfers (pending + in progress)
+     */
+    getActiveTransfers() {
+        const transfers = Array.from(this.activeTransfers.values());
+        return {
+            inProgress: transfers.filter(t => t.status === ActivityHistory.STATUS.IN_PROGRESS),
+            pending: transfers.filter(t => t.status === ActivityHistory.STATUS.PENDING),
+            all: transfers
+        };
+    }
+
+    /**
+     * Get transfer by ID
+     */
+    getTransfer(transferId) {
+        return this.activeTransfers.get(transferId);
+    }
+
+    /**
+     * Check if there are active transfers
+     */
+    hasActiveTransfers() {
+        return this.activeTransfers.size > 0;
     }
 
     /**
