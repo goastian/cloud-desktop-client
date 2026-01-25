@@ -186,10 +186,32 @@ class SyncEngine extends EventEmitter {
         console.log(`   Sync Folder: ${this.syncFolder}`);
         
         try {
-            // PASO 1: Escanear archivos locales
-            console.log('\n📂 PASO 1: Escaneando archivos locales...');
+            // PASO 1: Escanear archivos y carpetas locales
+            console.log('\n📂 PASO 1: Escaneando archivos y carpetas locales...');
             const localFiles = await this.scanLocalFiles();
-            console.log(`   Encontrados ${localFiles.length} archivos locales`);
+            const localFolders = this.getScannedFolders();
+            console.log(`   Encontrados ${localFiles.length} archivos y ${localFolders.length} carpetas locales`);
+            
+            // PASO 1.5: Crear estructura de carpetas en el servidor PRIMERO
+            if (localFolders.length > 0) {
+                console.log('\n📁 PASO 1.5: Creando estructura de carpetas en el servidor...');
+                
+                // Ordenar carpetas por profundidad (menos profunda primero)
+                const sortedFolders = [...localFolders].sort((a, b) => {
+                    const depthA = a.relativePath.split(path.sep).length;
+                    const depthB = b.relativePath.split(path.sep).length;
+                    return depthA - depthB;
+                });
+                
+                for (const folder of sortedFolders) {
+                    try {
+                        await this.getOrCreateServerFolder(folder.relativePath);
+                    } catch (error) {
+                        console.error(`   ✗ Error creando carpeta ${folder.relativePath}:`, error.message);
+                    }
+                }
+                console.log(`   ✓ Estructura de carpetas sincronizada`);
+            }
             
             // PASO 2: Obtener archivos del servidor
             console.log('\n☁️  PASO 2: Obteniendo archivos del servidor...');
@@ -212,11 +234,22 @@ class SyncEngine extends EventEmitter {
             // 4a: Subir archivos locales que no existen en el servidor
             if (syncActions.upload.length > 0) {
                 console.log('\n   ⬆️  Subiendo archivos nuevos al servidor...');
-                for (const localFile of syncActions.upload) {
+                
+                // Ordenar archivos por profundidad de directorio (menos profundo primero)
+                const sortedFiles = [...syncActions.upload].sort((a, b) => {
+                    const depthA = a.relativeDir ? a.relativeDir.split(path.sep).length : 0;
+                    const depthB = b.relativeDir ? b.relativeDir.split(path.sep).length : 0;
+                    return depthA - depthB;
+                });
+                
+                for (const localFile of sortedFiles) {
                     try {
-                        console.log(`      Subiendo: ${localFile.name}`);
+                        const displayPath = localFile.relativeDir 
+                            ? `${localFile.relativeDir}/${localFile.name}` 
+                            : localFile.name;
+                        console.log(`      Subiendo: ${displayPath}`);
                         await this.uploadFile(localFile.path);
-                        console.log(`      ✓ ${localFile.name} subido`);
+                        console.log(`      ✓ ${displayPath} subido`);
                     } catch (error) {
                         console.error(`      ✗ Error subiendo ${localFile.name}:`, error.message);
                     }
@@ -272,11 +305,17 @@ class SyncEngine extends EventEmitter {
     }
     
     /**
-     * Escanea recursivamente la carpeta local y retorna información de todos los archivos
+     * Escanea recursivamente la carpeta local y retorna información de todos los archivos y carpetas
      */
-    async scanLocalFiles(dir = null) {
+    async scanLocalFiles(dir = null, localFolders = null) {
         const scanDir = dir || this.syncFolder;
         const files = [];
+        const isRoot = dir === null;
+        
+        // Si es la primera llamada, inicializar el array de carpetas
+        if (isRoot) {
+            this._scannedFolders = [];
+        }
         
         try {
             const entries = await fs.readdir(scanDir, { withFileTypes: true });
@@ -308,6 +347,14 @@ class SyncEngine extends EventEmitter {
                         console.warn(`      ⚠️  No se pudo leer: ${entry.name}`);
                     }
                 } else if (entry.isDirectory()) {
+                    // Registrar la carpeta
+                    const folderRelativePath = path.relative(this.syncFolder, fullPath);
+                    this._scannedFolders.push({
+                        name: entry.name,
+                        path: fullPath,
+                        relativePath: folderRelativePath
+                    });
+                    
                     // Recursivamente escanear subdirectorios
                     const subFiles = await this.scanLocalFiles(fullPath);
                     files.push(...subFiles);
@@ -318,6 +365,13 @@ class SyncEngine extends EventEmitter {
         }
         
         return files;
+    }
+    
+    /**
+     * Obtiene las carpetas locales escaneadas
+     */
+    getScannedFolders() {
+        return this._scannedFolders || [];
     }
     
     /**
@@ -499,22 +553,29 @@ class SyncEngine extends EventEmitter {
             return null; // Raíz, no necesita folder_id
         }
         
+        // Normalizar la ruta (usar siempre / como separador para consistencia)
+        const normalizedPath = relativePath.split(path.sep).join('/');
+        
         // Verificar si ya tenemos esta carpeta mapeada
-        if (this.folderMap.has(relativePath)) {
-            return this.folderMap.get(relativePath);
+        if (this.folderMap.has(normalizedPath)) {
+            console.log(`      📂 Carpeta en cache: ${normalizedPath} -> ID: ${this.folderMap.get(normalizedPath)}`);
+            return this.folderMap.get(normalizedPath);
         }
         
         // Dividir la ruta en partes para crear jerarquía
-        const parts = relativePath.split(path.sep).filter(p => p && p !== '.');
+        const parts = normalizedPath.split('/').filter(p => p && p !== '.');
         let parentId = null;
         let currentPath = '';
         
+        console.log(`      📂 Creando jerarquía de carpetas: ${parts.join(' -> ')}`);
+        
         for (const folderName of parts) {
-            currentPath = currentPath ? path.join(currentPath, folderName) : folderName;
+            currentPath = currentPath ? `${currentPath}/${folderName}` : folderName;
             
             // Verificar si esta parte ya existe en el mapa
             if (this.folderMap.has(currentPath)) {
                 parentId = this.folderMap.get(currentPath);
+                console.log(`         ✓ ${currentPath} ya existe (ID: ${parentId})`);
                 continue;
             }
             
@@ -523,7 +584,7 @@ class SyncEngine extends EventEmitter {
                 const response = await this.apiRequest('get', '/api/external/folders', {
                     params: {
                         workspace_id: this.workspaceId,
-                        parent_id: parentId || 'null'
+                        parent_id: parentId === null ? 'null' : parentId
                     }
                 });
                 
@@ -535,8 +596,10 @@ class SyncEngine extends EventEmitter {
                 if (existingFolder) {
                     parentId = existingFolder.id;
                     this.folderMap.set(currentPath, existingFolder.id);
+                    console.log(`         ✓ ${currentPath} encontrada en servidor (ID: ${parentId})`);
                 } else {
                     // Crear la carpeta
+                    console.log(`         📁 Creando carpeta: ${folderName} (parent_id: ${parentId})`);
                     const createResponse = await this.apiRequest('post', '/api/external/folders', {
                         name: folderName,
                         workspace_id: this.workspaceId,
@@ -546,10 +609,10 @@ class SyncEngine extends EventEmitter {
                     const newFolder = createResponse.data.folder || createResponse.data;
                     parentId = newFolder.id;
                     this.folderMap.set(currentPath, newFolder.id);
-                    console.log(`      📁 Carpeta creada: ${currentPath} (ID: ${newFolder.id})`);
+                    console.log(`         ✓ ${currentPath} creada (ID: ${newFolder.id})`);
                 }
             } catch (error) {
-                console.error(`      ✗ Error creando carpeta ${currentPath}:`, error.message);
+                console.error(`         ✗ Error con carpeta ${currentPath}:`, error.message);
                 return null;
             }
         }
