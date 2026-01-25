@@ -1,7 +1,9 @@
 const chokidar = require('chokidar');
 const axios = require('axios');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { EventEmitter } = require('events');
 
 class SyncEngine extends EventEmitter {
@@ -105,18 +107,6 @@ class SyncEngine extends EventEmitter {
 
     async loadWorkspace() {
         try {
-            // First, debug the token to see if it's valid
-            try {
-                const debugResponse = await this.apiRequest('get', '/api/external/debug-token');
-                console.log('Token debug info:', JSON.stringify(debugResponse.data, null, 2));
-                
-                // Test POST with auth
-                const debugPostResponse = await this.apiRequest('post', '/api/external/debug-post', {});
-                console.log('POST debug info:', JSON.stringify(debugPostResponse.data, null, 2));
-            } catch (debugError) {
-                console.log('Debug endpoint error:', debugError.message);
-            }
-            
             const response = await this.apiRequest('get', '/api/external/workspaces');
             const workspaces = response.data.data || response.data;
             
@@ -134,24 +124,175 @@ class SyncEngine extends EventEmitter {
         }
     }
 
+    /**
+     * Sincronización inicial completa (Bootstrap Sync)
+     * 
+     * Flujo:
+     * 1. Escanear todos los archivos locales existentes
+     * 2. Obtener todos los archivos del servidor
+     * 3. Comparar estados y decidir acciones:
+     *    - Subir: archivo existe local pero no en servidor
+     *    - Descargar: archivo existe en servidor pero no local
+     *    - Conflicto: archivo existe en ambos pero son diferentes
+     * 4. Ejecutar las acciones de sincronización
+     */
     async safeInitialSync() {
-        console.log('🔽 Starting safe initial sync...');
+        console.log('\n' + '='.repeat(60));
+        console.log('🔄 BOOTSTRAP SYNC - Sincronización Inicial Completa');
+        console.log('='.repeat(60));
         console.log(`   Server URL: ${this.serverUrl}`);
         console.log(`   Workspace ID: ${this.workspaceId}`);
         console.log(`   Sync Folder: ${this.syncFolder}`);
-        console.log(`   Auth Token: ${this.authToken ? this.authToken.substring(0, 20) + '...' : 'NOT SET'}`);
         
         try {
-            // Use the external files endpoint for desktop clients
+            // PASO 1: Escanear archivos locales
+            console.log('\n📂 PASO 1: Escaneando archivos locales...');
+            const localFiles = await this.scanLocalFiles();
+            console.log(`   Encontrados ${localFiles.length} archivos locales`);
+            
+            // PASO 2: Obtener archivos del servidor
+            console.log('\n☁️  PASO 2: Obteniendo archivos del servidor...');
+            const serverFiles = await this.getServerFiles();
+            console.log(`   Encontrados ${serverFiles.length} archivos en el servidor`);
+            
+            // PASO 3: Comparar y decidir acciones
+            console.log('\n🔍 PASO 3: Comparando estados...');
+            const syncActions = await this.compareAndDecide(localFiles, serverFiles);
+            
+            console.log(`\n📊 Resumen de acciones:`);
+            console.log(`   ⬆️  Subir: ${syncActions.upload.length} archivos`);
+            console.log(`   ⬇️  Descargar: ${syncActions.download.length} archivos`);
+            console.log(`   ⚠️  Conflictos: ${syncActions.conflicts.length} archivos`);
+            console.log(`   ✓ Sin cambios: ${syncActions.unchanged.length} archivos`);
+            
+            // PASO 4: Ejecutar acciones de sincronización
+            console.log('\n⚡ PASO 4: Ejecutando sincronización...');
+            
+            // 4a: Subir archivos locales que no existen en el servidor
+            if (syncActions.upload.length > 0) {
+                console.log('\n   ⬆️  Subiendo archivos nuevos al servidor...');
+                for (const localFile of syncActions.upload) {
+                    try {
+                        console.log(`      Subiendo: ${localFile.name}`);
+                        await this.uploadFile(localFile.path);
+                        console.log(`      ✓ ${localFile.name} subido`);
+                    } catch (error) {
+                        console.error(`      ✗ Error subiendo ${localFile.name}:`, error.message);
+                    }
+                }
+            }
+            
+            // 4b: Descargar archivos del servidor que no existen localmente
+            if (syncActions.download.length > 0) {
+                console.log('\n   ⬇️  Descargando archivos del servidor...');
+                for (const serverFile of syncActions.download) {
+                    try {
+                        const fileName = this.getServerFileName(serverFile);
+                        const localPath = path.join(this.syncFolder, fileName);
+                        console.log(`      Descargando: ${fileName}`);
+                        await this.safeDownloadFile(serverFile, fileName, localPath);
+                        this.fileMap.set(localPath, serverFile.id);
+                    } catch (error) {
+                        console.error(`      ✗ Error descargando:`, error.message);
+                    }
+                }
+            }
+            
+            // 4c: Resolver conflictos (por defecto: servidor gana si es más reciente)
+            if (syncActions.conflicts.length > 0) {
+                console.log('\n   ⚠️  Resolviendo conflictos...');
+                for (const conflict of syncActions.conflicts) {
+                    try {
+                        await this.resolveConflict(conflict);
+                    } catch (error) {
+                        console.error(`      ✗ Error resolviendo conflicto:`, error.message);
+                    }
+                }
+            }
+            
+            // Guardar estado
+            this._saveFileMap();
+            
+            console.log('\n' + '='.repeat(60));
+            console.log('✓ BOOTSTRAP SYNC COMPLETADO');
+            console.log('='.repeat(60) + '\n');
+            
+        } catch (error) {
+            console.error('Error en sincronización inicial:', error.message);
+            throw error;
+        }
+    }
+    
+    /**
+     * Escanea recursivamente la carpeta local y retorna información de todos los archivos
+     */
+    async scanLocalFiles(dir = null) {
+        const scanDir = dir || this.syncFolder;
+        const files = [];
+        
+        try {
+            const entries = await fs.readdir(scanDir, { withFileTypes: true });
+            
+            for (const entry of entries) {
+                // Ignorar archivos ocultos y carpetas del sistema
+                if (entry.name.startsWith('.')) continue;
+                
+                const fullPath = path.join(scanDir, entry.name);
+                
+                if (entry.isFile()) {
+                    try {
+                        const stats = await fs.stat(fullPath);
+                        const hash = await this.calculateFileHash(fullPath);
+                        
+                        files.push({
+                            name: entry.name,
+                            path: fullPath,
+                            relativePath: path.relative(this.syncFolder, fullPath),
+                            size: stats.size,
+                            mtime: stats.mtime,
+                            hash: hash
+                        });
+                    } catch (error) {
+                        console.warn(`      ⚠️  No se pudo leer: ${entry.name}`);
+                    }
+                } else if (entry.isDirectory()) {
+                    // Recursivamente escanear subdirectorios
+                    const subFiles = await this.scanLocalFiles(fullPath);
+                    files.push(...subFiles);
+                }
+            }
+        } catch (error) {
+            console.error(`Error escaneando ${scanDir}:`, error.message);
+        }
+        
+        return files;
+    }
+    
+    /**
+     * Calcula el hash SHA256 de un archivo
+     */
+    async calculateFileHash(filePath) {
+        return new Promise((resolve, reject) => {
+            const hash = crypto.createHash('sha256');
+            const stream = fsSync.createReadStream(filePath);
+            
+            stream.on('data', data => hash.update(data));
+            stream.on('end', () => resolve(hash.digest('hex')));
+            stream.on('error', error => reject(error));
+        });
+    }
+    
+    /**
+     * Obtiene todos los archivos del servidor
+     */
+    async getServerFiles() {
+        try {
             const response = await this.apiRequest('get', '/api/external/files', {
                 params: { 
                     workspace_id: this.workspaceId
                 }
             });
             
-            console.log('API Response status:', response.status);
-            
-            // Handle both paginated and non-paginated responses
             let serverFiles = [];
             if (response.data && response.data.data) {
                 serverFiles = response.data.data;
@@ -159,75 +300,135 @@ class SyncEngine extends EventEmitter {
                 serverFiles = response.data;
             }
             
-            if (!Array.isArray(serverFiles) || serverFiles.length === 0) {
-                console.log('No files to sync from server');
-                return;
-            }
-            
-            console.log(`Found ${serverFiles.length} files on server`);
-            
-            for (const file of serverFiles) {
-                // Obtener nombre del archivo - SIEMPRE usar original_name primero
-                // El campo 'path' contiene el UUID, NO el nombre original
-                let fileName = file.original_name || file.name;
-                
-                // Si no tiene extensión, agregarla del mime_type
-                if (fileName && !path.extname(fileName) && file.mime_type) {
-                    const ext = this.getExtensionFromMimeType(file.mime_type);
-                    if (ext) {
-                        fileName = `${fileName}${ext}`;
-                    }
-                }
-                
-                // Si aún no hay nombre válido, usar el name con extensión del path
-                if (!fileName && file.path) {
-                    const pathExt = path.extname(file.path);
-                    fileName = file.name + pathExt;
-                }
-                
-                // Validación de seguridad
-                if (!fileName || fileName.includes('/') || fileName.includes('\\')) {
-                    console.warn(`⚠️  Skipping unsafe file: ${fileName || 'unknown'}`);
-                    continue;
-                }
-                
-                const localPath = path.join(this.syncFolder, fileName);
-                
-                // Verificar si ya está descargado y es el mismo archivo
-                if (this.fileMap.has(localPath) && this.fileMap.get(localPath) === file.id) {
-                    console.log(`⏭️  Already synced: ${fileName}`);
-                    continue;
-                }
-                
-                try {
-                    await fs.access(localPath);
-                    // File exists, check if needs update
-                    const stats = await fs.stat(localPath);
-                    const serverModified = new Date(file.updated_at);
-                    
-                    if (serverModified > stats.mtime) {
-                        console.log(`⬇️  Updating: ${fileName}`);
-                        await this.safeDownloadFile(file, fileName, localPath);
-                    } else {
-                        console.log(`✓ Up to date: ${fileName}`);
-                        this.fileMap.set(localPath, file.id);
-                    }
-                } catch {
-                    // File doesn't exist, download it
-                    console.log(`⬇️  Downloading: ${fileName}`);
-                    await this.safeDownloadFile(file, fileName, localPath);
-                }
-                
-                this.fileMap.set(localPath, file.id);
-            }
-            
-            // Save fileMap after initial sync
-            this._saveFileMap();
-            
-            console.log('✓ Initial sync completed');
+            return serverFiles || [];
         } catch (error) {
-            console.error('Error in initial sync:', error.message);
-            throw error;
+            console.error('Error obteniendo archivos del servidor:', error.message);
+            return [];
+        }
+    }
+    
+    /**
+     * Obtiene el nombre de archivo del servidor de forma segura
+     */
+    getServerFileName(file) {
+        let fileName = file.original_name || file.name;
+        
+        // Si no tiene extensión, agregarla del mime_type
+        if (fileName && !path.extname(fileName) && file.mime_type) {
+            const ext = this.getExtensionFromMimeType(file.mime_type);
+            if (ext) {
+                fileName = `${fileName}${ext}`;
+            }
+        }
+        
+        // Si aún no hay nombre válido, usar el name con extensión del path
+        if (!fileName && file.path) {
+            const pathExt = path.extname(file.path);
+            fileName = file.name + pathExt;
+        }
+        
+        return fileName || 'unknown';
+    }
+    
+    /**
+     * Compara archivos locales con archivos del servidor y decide qué acciones tomar
+     */
+    async compareAndDecide(localFiles, serverFiles) {
+        const actions = {
+            upload: [],      // Archivos locales que no existen en servidor
+            download: [],    // Archivos del servidor que no existen localmente
+            conflicts: [],   // Archivos que existen en ambos pero son diferentes
+            unchanged: []    // Archivos que están sincronizados
+        };
+        
+        // Crear mapa de archivos del servidor por nombre
+        const serverFileMap = new Map();
+        for (const serverFile of serverFiles) {
+            const fileName = this.getServerFileName(serverFile);
+            if (fileName && fileName !== 'unknown') {
+                serverFileMap.set(fileName.toLowerCase(), serverFile);
+            }
+        }
+        
+        // Crear mapa de archivos locales por nombre
+        const localFileMap = new Map();
+        for (const localFile of localFiles) {
+            localFileMap.set(localFile.name.toLowerCase(), localFile);
+        }
+        
+        // Comparar archivos locales con servidor
+        for (const localFile of localFiles) {
+            const serverFile = serverFileMap.get(localFile.name.toLowerCase());
+            
+            if (!serverFile) {
+                // Archivo existe localmente pero no en servidor -> SUBIR
+                actions.upload.push(localFile);
+            } else {
+                // Archivo existe en ambos -> comparar
+                const localPath = localFile.path;
+                const serverModified = new Date(serverFile.updated_at);
+                const localModified = localFile.mtime;
+                
+                // Verificar si ya está en el fileMap (ya sincronizado antes)
+                if (this.fileMap.has(localPath) && this.fileMap.get(localPath) === serverFile.id) {
+                    // Ya está sincronizado, verificar si cambió
+                    if (localFile.size === serverFile.size) {
+                        actions.unchanged.push({ local: localFile, server: serverFile });
+                    } else {
+                        // Tamaño diferente = conflicto
+                        actions.conflicts.push({ local: localFile, server: serverFile });
+                    }
+                } else {
+                    // No está en fileMap, comparar por tamaño y fecha
+                    if (localFile.size === serverFile.size) {
+                        // Mismo tamaño, asumir sincronizado
+                        this.fileMap.set(localPath, serverFile.id);
+                        actions.unchanged.push({ local: localFile, server: serverFile });
+                    } else {
+                        // Tamaño diferente = conflicto
+                        actions.conflicts.push({ local: localFile, server: serverFile });
+                    }
+                }
+            }
+        }
+        
+        // Encontrar archivos que existen en servidor pero no localmente
+        for (const serverFile of serverFiles) {
+            const fileName = this.getServerFileName(serverFile);
+            if (fileName && !localFileMap.has(fileName.toLowerCase())) {
+                // Validación de seguridad
+                if (!fileName.includes('/') && !fileName.includes('\\')) {
+                    actions.download.push(serverFile);
+                }
+            }
+        }
+        
+        return actions;
+    }
+    
+    /**
+     * Resuelve un conflicto entre archivo local y servidor
+     * Por defecto: el más reciente gana
+     */
+    async resolveConflict(conflict) {
+        const { local, server } = conflict;
+        const serverModified = new Date(server.updated_at);
+        const localModified = local.mtime;
+        
+        console.log(`      Conflicto: ${local.name}`);
+        console.log(`         Local: ${local.size} bytes, modificado ${localModified.toISOString()}`);
+        console.log(`         Server: ${server.size} bytes, modificado ${serverModified.toISOString()}`);
+        
+        if (serverModified > localModified) {
+            // Servidor es más reciente -> descargar
+            console.log(`         Resolución: Descargar versión del servidor (más reciente)`);
+            const fileName = this.getServerFileName(server);
+            await this.safeDownloadFile(server, fileName, local.path);
+            this.fileMap.set(local.path, server.id);
+        } else {
+            // Local es más reciente -> subir
+            console.log(`         Resolución: Subir versión local (más reciente)`);
+            await this.uploadFile(local.path);
         }
     }
 
@@ -542,19 +743,11 @@ class SyncEngine extends EventEmitter {
             requestConfig.data = data;
         }
 
-        console.log(`API Request: ${method.toUpperCase()} ${fullUrl}`);
-        console.log(`  Authorization: Bearer ${this.authToken ? this.authToken.substring(0, 30) + '...' : 'NOT SET'}`);
-        console.log(`  Headers:`, JSON.stringify(Object.keys(headers)));
-        
         try {
             const response = await axios(requestConfig);
             return response;
         } catch (error) {
-            console.error(`API Request failed: ${method.toUpperCase()} ${url}`);
-            console.error(`  Status: ${error.response?.status || 'N/A'}`);
-            console.error(`  Message: ${error.response?.data?.message || error.message}`);
-            console.error(`  Full URL: ${fullUrl}`);
-            console.error(`  Token present: ${!!this.authToken}`);
+            console.error(`API Error: ${method.toUpperCase()} ${url} - ${error.response?.status || 'N/A'}: ${error.response?.data?.message || error.message}`);
             throw error;
         }
     }
