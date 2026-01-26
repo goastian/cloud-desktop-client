@@ -214,6 +214,11 @@ function setupEventListeners() {
         await ipcRenderer.invoke('open-external', config.serverUrl);
     });
     
+    // Upgrade Plan button
+    document.getElementById('btnUpgradePlan').addEventListener('click', async () => {
+        await ipcRenderer.invoke('open-external', 'https://cloud2.astian.org/upgrade');
+    });
+    
     // Settings: Environment
     const settingsEnvToggle = document.getElementById('settingsEnvToggle');
     if (settingsEnvToggle) {
