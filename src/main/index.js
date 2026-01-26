@@ -1,6 +1,14 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage } = require('electron');
 const path = require('path');
 const Conf = require('conf');
+
+// Helper function to get correct asset path for both dev and packaged app
+function getAssetPath(assetName) {
+    if (app.isPackaged) {
+        return path.join(process.resourcesPath, 'assets', assetName);
+    }
+    return path.join(__dirname, '../../assets', assetName);
+}
 const axios = require('axios');
 const SyncEngine = require('./sync-engine');
 const AuthService = require('./auth-service');
@@ -45,7 +53,7 @@ function createWindow() {
             nodeIntegration: true,
             contextIsolation: false
         },
-        icon: path.join(__dirname, '../../assets/icon.png')
+        icon: getAssetPath(process.platform === 'win32' ? 'icon.ico' : 'icon.png')
     });
 
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
@@ -71,8 +79,15 @@ function createWindow() {
 }
 
 function createTray() {
-    const iconPath = path.join(__dirname, '../../assets/tray-icon.png');
-    tray = new Tray(iconPath);
+    const iconPath = getAssetPath(process.platform === 'win32' ? 'icon.ico' : 'tray-icon.png');
+    const trayIcon = nativeImage.createFromPath(iconPath);
+    
+    // For Windows, resize the icon to appropriate tray size
+    if (process.platform === 'win32') {
+        tray = new Tray(trayIcon.resize({ width: 16, height: 16 }));
+    } else {
+        tray = new Tray(trayIcon);
+    }
 
     const updateTrayMenu = () => {
         const isAuthenticated = store.get('authenticated', false);

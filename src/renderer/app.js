@@ -33,9 +33,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (config.authenticated) {
         showDashboard();
     } else {
-        // Update server URL input based on environment
-        updateServerUrlInput(config);
-        showStep('server');
+        // In production mode (not dev), skip the server URL step since it's hardcoded
+        // Go directly to email step
+        if (!isDevMode) {
+            // Server URL is already set via hardcoded config
+            showStep('email');
+        } else {
+            // In dev mode, show server step with environment toggle
+            updateServerUrlInput(config);
+            showStep('server');
+        }
     }
     
     setupEventListeners();
@@ -84,7 +91,11 @@ function setupEventListeners() {
 
     // Step 2: Email Validation
     document.getElementById('btnBackToServer').addEventListener('click', () => {
-        showStep('server');
+        // In production mode, there's no server step to go back to
+        // Only show server step in dev mode
+        if (isDevMode) {
+            showStep('server');
+        }
     });
 
     document.getElementById('btnValidateEmail').addEventListener('click', async () => {
@@ -1048,6 +1059,12 @@ function showDevControls(show) {
     const devSettingsSection = document.getElementById('devSettingsSection');
     if (devSettingsSection) {
         devSettingsSection.style.display = show ? 'block' : 'none';
+    }
+    
+    // Show/hide back button in email step (only in dev mode)
+    const btnBackToServer = document.getElementById('btnBackToServer');
+    if (btnBackToServer) {
+        btnBackToServer.style.display = show ? 'block' : 'none';
     }
 }
 
