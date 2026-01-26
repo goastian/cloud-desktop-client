@@ -12,6 +12,8 @@ let activityHistory = [];
 let cacheStats = {};
 let environmentConfig = {};
 let isDevMode = false;
+let storageStats = { used: 0, total: 10 * 1024 * 1024 * 1024 };
+let storageUpdateInterval = null;
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
@@ -403,6 +405,10 @@ async function showDashboard() {
     
     // Load cache stats
     await loadCacheStats();
+    
+    // Load storage stats and start polling
+    await loadStorageStats();
+    startStoragePolling();
     
     // Initialize offline cache
     await ipcRenderer.invoke('init-offline-cache');
@@ -1041,6 +1047,69 @@ function showDevControls(show) {
 }
 
 // ============================================
+// Storage Stats Management
+// ============================================
+
+async function loadStorageStats() {
+    const result = await ipcRenderer.invoke('get-storage-stats');
+    if (result.success) {
+        storageStats = {
+            used: result.used,
+            total: result.total
+        };
+        updateStorageUI();
+    }
+}
+
+function updateStorageUI() {
+    const used = storageStats.used || 0;
+    const total = storageStats.total || (10 * 1024 * 1024 * 1024);
+    const percentage = total > 0 ? (used / total) * 100 : 0;
+    
+    // Update text elements
+    const storageText = document.getElementById('storageText');
+    const storageUsed = document.getElementById('storageUsed');
+    const storageTotal = document.getElementById('storageTotal');
+    const storageBarFill = document.getElementById('storageBarFill');
+    
+    if (storageText) {
+        storageText.textContent = `${formatBytes(used)} / ${formatBytes(total)}`;
+    }
+    if (storageUsed) {
+        storageUsed.textContent = formatBytes(used);
+    }
+    if (storageTotal) {
+        storageTotal.textContent = formatBytes(total);
+    }
+    if (storageBarFill) {
+        storageBarFill.style.width = `${Math.min(percentage, 100)}%`;
+        
+        // Add warning/critical classes based on usage
+        storageBarFill.classList.remove('warning', 'critical');
+        if (percentage >= 90) {
+            storageBarFill.classList.add('critical');
+        } else if (percentage >= 75) {
+            storageBarFill.classList.add('warning');
+        }
+    }
+}
+
+function startStoragePolling() {
+    // Update storage stats every 30 seconds
+    if (storageUpdateInterval) {
+        clearInterval(storageUpdateInterval);
+    }
+    storageUpdateInterval = setInterval(loadStorageStats, 30000);
+}
+
+function stopStoragePolling() {
+    if (storageUpdateInterval) {
+        clearInterval(storageUpdateInterval);
+        storageUpdateInterval = null;
+    }
+}
+
+// ============================================
 // Active Transfers Management
 // ============================================
 
@@ -1134,6 +1203,14 @@ ipcRenderer.on('transfer-progress', (event, transfer) => {
         const progressText = transferEl.querySelector('.transfer-progress-text');
         if (progressFill) progressFill.style.width = `${transfer.progress}%`;
         if (progressText) progressText.textContent = `${Math.round(transfer.progress)}%`;
+    }
+});
+
+// Update storage when transfers complete
+ipcRenderer.on('transfers-updated', (event, transfers) => {
+    // If a transfer just completed, refresh storage stats
+    if (transfers.all.length === 0 || transfers.inProgress.length === 0) {
+        loadStorageStats();
     }
 });
 

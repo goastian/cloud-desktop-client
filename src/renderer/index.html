@@ -361,6 +361,68 @@
             opacity: 0.8;
         }
 
+        /* Storage Card */
+        .storage-card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .storage-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .storage-icon {
+            font-size: 16px;
+        }
+
+        .storage-label {
+            font-weight: 600;
+            font-size: 13px;
+            color: #333;
+            flex: 1;
+        }
+
+        .storage-text {
+            font-size: 12px;
+            color: #667eea;
+            font-weight: 600;
+        }
+
+        .storage-bar {
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 6px;
+        }
+
+        .storage-bar-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        .storage-bar-fill.warning {
+            background: linear-gradient(135deg, #f39c12 0%, #e74c3c 100%);
+        }
+
+        .storage-bar-fill.critical {
+            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+        }
+
+        .storage-details {
+            font-size: 11px;
+            color: #888;
+            text-align: center;
+        }
+
         .device-name-input {
             background: rgba(255,255,255,0.2);
             border: 1px solid rgba(255,255,255,0.3);
@@ -1158,6 +1220,21 @@
                 <h4>Connected devices</h4>
                 <div class="device-name" id="dashDeviceName">My Device</div>
                 <div class="device-info" id="dashDeviceInfo">Windows • Connected</div>
+            </div>
+
+            <!-- Storage Info -->
+            <div class="storage-card">
+                <div class="storage-header">
+                    <span class="storage-icon">💾</span>
+                    <span class="storage-label">Storage</span>
+                    <span class="storage-text" id="storageText">-- / --</span>
+                </div>
+                <div class="storage-bar">
+                    <div class="storage-bar-fill" id="storageBarFill" style="width: 0%"></div>
+                </div>
+                <div class="storage-details">
+                    <span id="storageUsed">0 B</span> of <span id="storageTotal">10 GB</span> used
+                </div>
             </div>
 
             <!-- Tabs -->

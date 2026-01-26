@@ -262,6 +262,43 @@ ipcMain.handle('get-config', async () => {
     };
 });
 
+// Storage Stats
+ipcMain.handle('get-storage-stats', async () => {
+    try {
+        const token = store.get('authToken');
+        if (!token) {
+            console.log('[Storage] No auth token');
+            return { success: false, error: 'Not authenticated' };
+        }
+        
+        const serverUrl = environmentConfig.getServerUrl();
+        console.log('[Storage] Fetching from:', `${serverUrl}/api/external/storage/stats`);
+        
+        const response = await axios.get(`${serverUrl}/api/external/storage/stats`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/json'
+            }
+        });
+        
+        console.log('[Storage] Response:', response.data);
+        
+        return {
+            success: true,
+            used: response.data.used || 0,
+            total: response.data.total || 10 * 1024 * 1024 * 1024,
+            workspace_id: response.data.workspace_id
+        };
+    } catch (error) {
+        console.error('[Storage] Error:', error.message);
+        if (error.response) {
+            console.error('[Storage] Response status:', error.response.status);
+            console.error('[Storage] Response data:', error.response.data);
+        }
+        return { success: false, error: error.message };
+    }
+});
+
 ipcMain.handle('set-server-url', async (event, url) => {
     // In production mode, update the production URL
     // In development mode, this is ignored (always localhost:8000)
