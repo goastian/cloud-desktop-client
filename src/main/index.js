@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage } = require('electron');
 const path = require('path');
 const Conf = require('conf');
+const axios = require('axios');
 const SyncEngine = require('./sync-engine');
 const AuthService = require('./auth-service');
 const DeviceManager = require('./device-manager');
