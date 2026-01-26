@@ -1,10 +1,11 @@
 /**
  * Environment Configuration Service
  * 
- * Manages development and production environments for the desktop client.
- * - Development: http://localhost:8000 (fixed)
- * - Production: Configurable URL (default: https://cloud2.astian.org)
+ * Manages server URL for the desktop client.
+ * Server URL is hardcoded to https://cloud2.astian.org
  */
+
+const HARDCODED_SERVER_URL = 'https://cloud2.astian.org';
 
 const ENVIRONMENTS = {
     DEVELOPMENT: 'development',
@@ -13,7 +14,7 @@ const ENVIRONMENTS = {
 
 const DEFAULT_URLS = {
     [ENVIRONMENTS.DEVELOPMENT]: 'http://localhost:8000',
-    [ENVIRONMENTS.PRODUCTION]: 'https://cloud2.astian.org'
+    [ENVIRONMENTS.PRODUCTION]: HARDCODED_SERVER_URL
 };
 
 class EnvironmentConfig {
@@ -76,51 +77,18 @@ class EnvironmentConfig {
     }
 
     /**
-     * Get the server URL based on current environment
+     * Get the server URL - always returns hardcoded URL
      */
     getServerUrl() {
-        const env = this.getEnvironment();
-        
-        if (env === ENVIRONMENTS.DEVELOPMENT) {
-            // Development URL is always localhost:8000
-            return DEFAULT_URLS[ENVIRONMENTS.DEVELOPMENT];
-        }
-        
-        // Production URL can be customized
-        return this.store.get('productionUrl', DEFAULT_URLS[ENVIRONMENTS.PRODUCTION]);
+        // Always return hardcoded server URL
+        return HARDCODED_SERVER_URL;
     }
 
     /**
-     * Set the production server URL
-     * @param {string} url - The production server URL
-     */
-    setProductionUrl(url) {
-        if (!url || typeof url !== 'string') {
-            throw new Error('Invalid URL');
-        }
-        
-        // Validate URL format
-        try {
-            new URL(url);
-        } catch (e) {
-            throw new Error('Invalid URL format');
-        }
-        
-        this.store.set('productionUrl', url);
-        
-        // If currently in production, update serverUrl
-        if (this.isProduction()) {
-            this.store.set('serverUrl', url);
-        }
-        
-        return url;
-    }
-
-    /**
-     * Get the production server URL (even if in development mode)
+     * Get the production server URL (hardcoded)
      */
     getProductionUrl() {
-        return this.store.get('productionUrl', DEFAULT_URLS[ENVIRONMENTS.PRODUCTION]);
+        return HARDCODED_SERVER_URL;
     }
 
     /**

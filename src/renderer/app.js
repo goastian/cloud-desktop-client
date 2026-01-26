@@ -191,8 +191,12 @@ function setupEventListeners() {
             const result = await ipcRenderer.invoke('set-device-name', name);
             if (result.success) {
                 deviceInfo = result.device;
+                // Update device name in header immediately
+                const dashDeviceName = document.getElementById('dashDeviceName');
+                if (dashDeviceName) {
+                    dashDeviceName.textContent = name;
+                }
                 updateDeviceCard();
-                alert('Nombre guardado');
             }
         }
     });

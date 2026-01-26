@@ -1276,42 +1276,12 @@
                     Save name
                 </button>
 
-                <h3>🔗 Servidor</h3>
-                <div class="form-group">
-                    <label>URL del Servidor</label>
-                    <div class="folder-display" id="settingsServerUrl">https://cloud2.astian.org</div>
-                </div>
-                
-                <!-- Environment Settings (only visible in dev mode) -->
-                <div id="devSettingsSection" style="display: none;">
-                    <h3 style="margin-top: 16px;">🔧 Dev Mode</h3>
-                    <div class="env-settings-container">
-                        <div class="env-toggle-row">
-                            <span id="settingsEnvLabel" class="env-label env-prod">🌐 Production</span>
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="settingsEnvToggle">
-                                <span class="toggle-slider"></span>
-                            </label>
-                            <span class="env-hint">Dev Mode</span>
-                        </div>
-                        <p class="env-description">
-                            <strong>Dev:</strong> Connect to localhost:8000 (fixed)<br>
-                            <strong>Production:</strong> Connect to the configured server
-                        </p>
-                    </div>
-                    
-                    <div id="productionUrlSection" class="form-group">
-                        <label for="settingsProductionUrl">Production URL</label>
-                        <input 
-                            type="text" 
-                            id="settingsProductionUrl" 
-                            placeholder="https://cloud2.astian.org"
-                        >
-                        <button id="btnSaveProductionUrl" class="btn-secondary btn-small" style="margin-top: 8px;">
-                            Save URL
-                        </button>
-                    </div>
-                </div>
+                <!-- Server URL is hardcoded, hidden from UI -->
+                <div id="settingsServerUrl" style="display: none;">https://cloud2.astian.org</div>
+                <div id="devSettingsSection" style="display: none;"></div>
+                <div id="settingsEnvLabel" style="display: none;"></div>
+                <input type="checkbox" id="settingsEnvToggle" style="display: none;">
+                <input type="text" id="settingsProductionUrl" style="display: none;">
 
                 <h3 style="margin-top: 20px;">📡 Bandwidth Limit</h3>
                 <div class="bandwidth-settings">
