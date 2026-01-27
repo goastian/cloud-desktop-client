@@ -186,6 +186,13 @@ class SyncEngine extends EventEmitter {
         console.log(`   Workspace ID: ${this.workspaceId}`);
         console.log(`   Sync Folder: ${this.syncFolder}`);
         
+        const syncStartTime = Date.now();
+        
+        // Log sync start
+        if (this.activityHistory) {
+            this.activityHistory.logSyncStart(this.folderId, path.basename(this.syncFolder));
+        }
+        
         try {
             // PASO 1: Escanear archivos y carpetas locales
             console.log('\n📂 PASO 1: Escaneando archivos y carpetas locales...');
@@ -251,8 +258,19 @@ class SyncEngine extends EventEmitter {
                         console.log(`      Subiendo: ${displayPath}`);
                         await this.uploadFile(localFile.path);
                         console.log(`      ✓ ${displayPath} subido`);
+                        
+                        // Log activity
+                        if (this.activityHistory) {
+                            this.activityHistory.logUpload(localFile.path, localFile.size, this.folderId);
+                        }
                     } catch (error) {
                         console.error(`      ✗ Error subiendo ${localFile.name}:`, error.message);
+                        if (this.activityHistory) {
+                            this.activityHistory.logError(`Error subiendo ${localFile.name}`, { 
+                                filePath: localFile.path, 
+                                error: error.message 
+                            });
+                        }
                     }
                 }
             }
@@ -274,8 +292,18 @@ class SyncEngine extends EventEmitter {
                         console.log(`      Descargando: ${serverRelativePath}`);
                         await this.safeDownloadFile(serverFile, fileName, localPath);
                         this.fileMap.set(localPath, serverFile.id);
+                        
+                        // Log activity
+                        if (this.activityHistory) {
+                            this.activityHistory.logDownload(localPath, serverFile.size || 0, this.folderId);
+                        }
                     } catch (error) {
                         console.error(`      ✗ Error descargando:`, error.message);
+                        if (this.activityHistory) {
+                            this.activityHistory.logError(`Error descargando ${serverFile.name || 'archivo'}`, { 
+                                error: error.message 
+                            });
+                        }
                     }
                 }
             }
@@ -294,6 +322,18 @@ class SyncEngine extends EventEmitter {
             
             // Guardar estado
             this._saveFileMap();
+            this._saveFolderMap();
+            
+            const syncDuration = Date.now() - syncStartTime;
+            
+            // Log sync complete
+            if (this.activityHistory) {
+                this.activityHistory.logSyncComplete(this.folderId, path.basename(this.syncFolder), {
+                    uploaded: syncActions.upload.length,
+                    downloaded: syncActions.download.length,
+                    duration: syncDuration
+                });
+            }
             
             console.log('\n' + '='.repeat(60));
             console.log('✓ BOOTSTRAP SYNC COMPLETADO');
@@ -301,6 +341,9 @@ class SyncEngine extends EventEmitter {
             
         } catch (error) {
             console.error('Error en sincronización inicial:', error.message);
+            if (this.activityHistory) {
+                this.activityHistory.logError('Error en sincronización inicial', { error: error.message });
+            }
             throw error;
         }
     }
@@ -439,6 +482,15 @@ class SyncEngine extends EventEmitter {
     }
     
     /**
+     * Normaliza una ruta para comparación cross-platform
+     * Convierte separadores a / y lowercase
+     */
+    normalizePath(p) {
+        if (!p) return '';
+        return p.replace(/\\/g, '/').toLowerCase();
+    }
+    
+    /**
      * Compara archivos locales con archivos del servidor y decide qué acciones tomar
      * Considera la estructura de carpetas para una comparación correcta
      */
@@ -459,7 +511,12 @@ class SyncEngine extends EventEmitter {
             folderIdToPath.set(folder.id, this.buildFolderPath(folder, serverFolders));
         }
         
-        // Crear mapa de archivos del servidor por ruta relativa completa
+        console.log(`   📊 Carpetas del servidor: ${serverFolders.length}`);
+        for (const [id, folderPath] of folderIdToPath) {
+            console.log(`      folder_id ${id} -> ${folderPath}`);
+        }
+        
+        // Crear mapa de archivos del servidor por ruta relativa completa (normalizada)
         const serverFileMap = new Map();
         for (const serverFile of serverFiles) {
             const fileName = this.getServerFileName(serverFile);
@@ -468,21 +525,26 @@ class SyncEngine extends EventEmitter {
                 let relativePath = fileName;
                 if (serverFile.folder_id && folderIdToPath.has(serverFile.folder_id)) {
                     const folderPath = folderIdToPath.get(serverFile.folder_id);
-                    relativePath = path.join(folderPath, fileName);
+                    relativePath = folderPath + '/' + fileName;
                 }
-                serverFileMap.set(relativePath.toLowerCase(), { ...serverFile, serverRelativePath: relativePath });
+                const normalizedPath = this.normalizePath(relativePath);
+                serverFileMap.set(normalizedPath, { ...serverFile, serverRelativePath: relativePath });
             }
         }
         
-        // Crear mapa de archivos locales por ruta relativa
+        // Crear mapa de archivos locales por ruta relativa (normalizada)
         const localFileMap = new Map();
         for (const localFile of localFiles) {
-            localFileMap.set(localFile.relativePath.toLowerCase(), localFile);
+            const normalizedPath = this.normalizePath(localFile.relativePath);
+            localFileMap.set(normalizedPath, localFile);
         }
+        
+        console.log(`   📊 Archivos locales: ${localFileMap.size}, Archivos servidor: ${serverFileMap.size}`);
         
         // Comparar archivos locales con servidor
         for (const localFile of localFiles) {
-            const serverFile = serverFileMap.get(localFile.relativePath.toLowerCase());
+            const normalizedLocalPath = this.normalizePath(localFile.relativePath);
+            const serverFile = serverFileMap.get(normalizedLocalPath);
             
             if (!serverFile) {
                 // Archivo existe localmente pero no en servidor -> SUBIR
@@ -526,6 +588,7 @@ class SyncEngine extends EventEmitter {
     
     /**
      * Construye la ruta completa de una carpeta basándose en su jerarquía de padres
+     * Siempre usa / como separador para consistencia cross-platform
      */
     buildFolderPath(folder, allFolders) {
         const parts = [folder.name];
@@ -541,7 +604,8 @@ class SyncEngine extends EventEmitter {
             }
         }
         
-        return parts.join(path.sep);
+        // Usar / siempre para consistencia cross-platform
+        return parts.join('/');
     }
     
     /**

@@ -79,15 +79,25 @@ function createWindow() {
 }
 
 function createTray() {
-    const iconPath = getAssetPath(process.platform === 'win32' ? 'icon.ico' : 'tray-icon.png');
-    const trayIcon = nativeImage.createFromPath(iconPath);
+    // Use PNG for all platforms - Windows needs proper PNG, not ICO for tray
+    const iconPath = getAssetPath('tray-icon-32.png');
+    let trayIcon = nativeImage.createFromPath(iconPath);
     
-    // For Windows, resize the icon to appropriate tray size
+    // Fallback to regular icon if tray-icon-32 doesn't exist
+    if (trayIcon.isEmpty()) {
+        const fallbackPath = getAssetPath('icon.png');
+        trayIcon = nativeImage.createFromPath(fallbackPath);
+    }
+    
+    // For Windows, resize the icon to appropriate tray size (16x16 or 32x32)
     if (process.platform === 'win32') {
+        // Windows system tray typically uses 16x16 or 32x32 icons
         tray = new Tray(trayIcon.resize({ width: 16, height: 16 }));
     } else {
         tray = new Tray(trayIcon);
     }
+    
+    console.log('Tray icon created from:', iconPath);
 
     const updateTrayMenu = () => {
         const isAuthenticated = store.get('authenticated', false);
