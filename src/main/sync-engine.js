@@ -5,15 +5,66 @@ const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
+const { Transform } = require('stream');
+
+/**
+ * E2: ThrottleTransform — a Transform stream that limits throughput to maxBytesPerSec.
+ * Passes data through in timed chunks so the overall rate stays at or below the limit.
+ */
+class ThrottleTransform extends Transform {
+    constructor(maxBytesPerSec) {
+        super();
+        this.maxBytesPerSec = maxBytesPerSec;
+        this.bytesSentInWindow = 0;
+        this.windowStart = Date.now();
+    }
+
+    _transform(chunk, encoding, callback) {
+        if (!this.maxBytesPerSec || this.maxBytesPerSec <= 0) {
+            // No limit — passthrough
+            this.push(chunk);
+            return callback();
+        }
+
+        const sendChunk = (offset) => {
+            if (offset >= chunk.length) return callback();
+
+            const now = Date.now();
+            const elapsed = now - this.windowStart;
+
+            // Reset window every second
+            if (elapsed >= 1000) {
+                this.bytesSentInWindow = 0;
+                this.windowStart = now;
+            }
+
+            const remaining = this.maxBytesPerSec - this.bytesSentInWindow;
+            if (remaining <= 0) {
+                // Wait until next window
+                const waitMs = 1000 - elapsed;
+                setTimeout(() => sendChunk(offset), waitMs);
+                return;
+            }
+
+            const slice = chunk.slice(offset, offset + remaining);
+            this.push(slice);
+            this.bytesSentInWindow += slice.length;
+            sendChunk(offset + slice.length);
+        };
+
+        sendChunk(0);
+    }
+}
 
 class SyncEngine extends EventEmitter {
-    constructor(syncFolder, authToken, serverUrl, store, activityHistory = null) {
+    constructor(syncFolder, authToken, serverUrl, store, activityHistory = null, settingsManager = null) {
         super();
         this.syncFolder = syncFolder;
         this.authToken = authToken;
         this.serverUrl = serverUrl;
         this.store = store;
         this.activityHistory = activityHistory;
+        this.settingsManager = settingsManager; // E1: For selective sync exclusion checks
         this.watcher = null;
         this.syncing = false;
         this.paused = false;
@@ -23,6 +74,10 @@ class SyncEngine extends EventEmitter {
         this.folderMap = new Map();      // Mapa: ruta relativa carpeta → ID carpeta servidor
         this.workspaceId = null;
         this.folderId = null; // Set externally for multi-folder support
+        this.downloadingPaths = new Set(); // A5 fix: Track paths being downloaded to avoid re-upload loops
+        this.maxConcurrency = 3; // C4: Max concurrent uploads
+        this.activeUploads = 0; // C4: Current active upload count
+        this.maxRetries = 3; // C4: Max retry attempts per item
         
         // Load persisted maps for this folder
         this._loadFileMap();
@@ -84,6 +139,45 @@ class SyncEngine extends EventEmitter {
         }
     }
 
+    // A2: Persist sync queue for crash recovery
+    _getQueueKey() {
+        const folderHash = Buffer.from(this.syncFolder).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
+        return `syncQueue_${folderHash}`;
+    }
+
+    _loadQueue() {
+        try {
+            const saved = this.store.get(this._getQueueKey(), null);
+            if (Array.isArray(saved) && saved.length > 0) {
+                this.syncQueue = saved;
+                console.log(`[A2] Recovered ${saved.length} pending queue items for ${this.syncFolder}`);
+            }
+        } catch (error) {
+            console.warn('Could not load sync queue:', error.message);
+        }
+    }
+
+    _saveQueue() {
+        try {
+            this.store.set(this._getQueueKey(), this.syncQueue);
+        } catch (error) {
+            console.warn('Could not save sync queue:', error.message);
+        }
+    }
+
+    _clearPersistedQueue() {
+        this.store.delete(this._getQueueKey());
+    }
+
+    /**
+     * E1: Check if a file should be excluded from sync based on settings
+     */
+    _isExcluded(filePath) {
+        if (!this.settingsManager) return false;
+        const fileName = path.basename(filePath);
+        return this.settingsManager.shouldExcludeFile(filePath, fileName);
+    }
+
     /**
      * Limpia el cache de sincronización para forzar una re-sincronización completa
      */
@@ -101,6 +195,9 @@ class SyncEngine extends EventEmitter {
         this.syncing = true;
         this.processing = true;
         this.emit('status-changed');
+
+        // A2: Recover any pending queue items from a previous crash
+        this._loadQueue();
 
         try {
             // Get default workspace
@@ -419,17 +516,47 @@ class SyncEngine extends EventEmitter {
     }
     
     /**
-     * Calcula el hash SHA256 de un archivo
+     * A4: Calcula hash de un archivo — usa hash parcial para archivos grandes (>10MB)
+     * Lee solo los primeros y últimos 64KB + tamaño para detección rápida de cambios
      */
     async calculateFileHash(filePath) {
-        return new Promise((resolve, reject) => {
-            const hash = crypto.createHash('sha256');
-            const stream = fsSync.createReadStream(filePath);
-            
-            stream.on('data', data => hash.update(data));
-            stream.on('end', () => resolve(hash.digest('hex')));
-            stream.on('error', error => reject(error));
-        });
+        const PARTIAL_THRESHOLD = 10 * 1024 * 1024; // 10MB
+        const CHUNK_SIZE = 64 * 1024; // 64KB
+
+        const stats = await fs.stat(filePath);
+
+        if (stats.size <= PARTIAL_THRESHOLD) {
+            // Small file: full hash
+            return new Promise((resolve, reject) => {
+                const hash = crypto.createHash('sha256');
+                const stream = fsSync.createReadStream(filePath);
+                stream.on('data', data => hash.update(data));
+                stream.on('end', () => resolve(hash.digest('hex')));
+                stream.on('error', error => reject(error));
+            });
+        }
+
+        // Large file: partial hash (first chunk + last chunk + size)
+        const hash = crypto.createHash('sha256');
+        hash.update(`size:${stats.size}`);
+
+        // Read first chunk
+        const headBuf = Buffer.alloc(CHUNK_SIZE);
+        const fd = await fs.open(filePath, 'r');
+        try {
+            await fd.read(headBuf, 0, CHUNK_SIZE, 0);
+            hash.update(headBuf);
+
+            // Read last chunk
+            const tailOffset = Math.max(0, stats.size - CHUNK_SIZE);
+            const tailBuf = Buffer.alloc(CHUNK_SIZE);
+            await fd.read(tailBuf, 0, CHUNK_SIZE, tailOffset);
+            hash.update(tailBuf);
+        } finally {
+            await fd.close();
+        }
+
+        return hash.digest('hex');
     }
     
     /**
@@ -715,18 +842,57 @@ class SyncEngine extends EventEmitter {
         console.log(`      Conflicto: ${local.name}`);
         console.log(`         Local: ${local.size} bytes, modificado ${localModified.toISOString()}`);
         console.log(`         Server: ${server.size} bytes, modificado ${serverModified.toISOString()}`);
-        
-        if (serverModified > localModified) {
-            // Servidor es más reciente -> descargar
-            console.log(`         Resolución: Descargar versión del servidor (más reciente)`);
+
+        // C7: If conflict resolution mode is 'ask', emit to renderer and wait
+        const conflictMode = this.settingsManager ? this.settingsManager.getSetting('conflictMode', 'auto') : 'auto';
+        let resolution;
+
+        if (conflictMode === 'ask' && this._conflictResolver) {
+            resolution = await this._conflictResolver({
+                fileName: local.name,
+                localPath: local.path,
+                localSize: local.size,
+                localModified: localModified.toISOString(),
+                serverSize: server.size,
+                serverModified: serverModified.toISOString(),
+            });
+        } else {
+            // Auto-resolve: newest wins
+            resolution = serverModified > localModified ? 'server' : 'local';
+        }
+
+        if (resolution === 'server') {
+            console.log(`         Resolución: Descargar versión del servidor`);
             const fileName = this.getServerFileName(server);
             await this.safeDownloadFile(server, fileName, local.path);
             this.fileMap.set(local.path, server.id);
-        } else {
-            // Local es más reciente -> subir
-            console.log(`         Resolución: Subir versión local (más reciente)`);
+        } else if (resolution === 'local') {
+            console.log(`         Resolución: Subir versión local`);
             await this.uploadFile(local.path);
+        } else if (resolution === 'both') {
+            // Keep both: rename local with .conflict suffix, then download server version
+            const ext = path.extname(local.path);
+            const base = local.path.slice(0, -ext.length || undefined);
+            const conflictPath = `${base}.conflict-${Date.now()}${ext}`;
+            await fs.promises.rename(local.path, conflictPath);
+            console.log(`         Resolución: Mantener ambos (local renombrado a ${path.basename(conflictPath)})`);
+            const fileName = this.getServerFileName(server);
+            await this.safeDownloadFile(server, fileName, local.path);
+            this.fileMap.set(local.path, server.id);
+            // Upload the renamed conflict copy
+            await this.uploadFile(conflictPath);
+        } else {
+            // Skip
+            console.log(`         Resolución: Omitido`);
         }
+    }
+
+    /**
+     * C7: Set a conflict resolver callback. Called with conflict info, must return
+     * a Promise resolving to 'server', 'local', 'both', or 'skip'.
+     */
+    setConflictResolver(resolver) {
+        this._conflictResolver = resolver;
     }
 
     getExtensionFromMimeType(mimeType) {
@@ -771,37 +937,47 @@ class SyncEngine extends EventEmitter {
 
     async safeDownloadFile(file, fileName, localPath) {
         try {
-            // IMPORTANTE: Para GET requests, pasar null como data y las opciones como config
-            const response = await this.apiRequest('get', `/api/external/files/${file.id}/download`, null, {
-                responseType: 'arraybuffer'
-            });
+            // A5 fix: Mark path as downloading so watcher handlers skip events for it
+            this.downloadingPaths.add(localPath);
             
-            if (!response.data || response.data.byteLength === 0) {
-                console.error('Empty file received:', fileName);
-                return;
+            // E2: Use streaming download with optional bandwidth throttling
+            if (this.downloadBandwidthLimit && this.downloadBandwidthLimit > 0) {
+                const response = await this.apiRequest('get', `/api/external/files/${file.id}/download`, null, {
+                    responseType: 'stream'
+                });
+                
+                await new Promise((resolve, reject) => {
+                    const throttle = new ThrottleTransform(this.downloadBandwidthLimit);
+                    const writeStream = fsSync.createWriteStream(localPath);
+                    response.data
+                        .pipe(throttle)
+                        .pipe(writeStream)
+                        .on('finish', resolve)
+                        .on('error', reject);
+                    response.data.on('error', reject);
+                });
+            } else {
+                const response = await this.apiRequest('get', `/api/external/files/${file.id}/download`, null, {
+                    responseType: 'arraybuffer'
+                });
+                
+                if (!response.data || response.data.byteLength === 0) {
+                    console.error('Empty file received:', fileName);
+                    return;
+                }
+                
+                const buffer = Buffer.from(response.data);
+                await fs.writeFile(localPath, buffer);
             }
             
-            const buffer = Buffer.from(response.data);
-            
-            // IMPORTANTE: Pausar watcher temporalmente para evitar que detecte
-            // este archivo como "nuevo" y lo intente subir de nuevo (loop infinito)
-            const wasWatching = this.watcher !== null;
-            if (wasWatching) {
-                await this.watcher.unwatch(localPath);
-            }
-            
-            await fs.writeFile(localPath, buffer);
-            
-            // Esperar un momento antes de reactivar el watch
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            if (wasWatching) {
-                this.watcher.add(localPath);
-            }
-            
-            console.log(`✓ Downloaded: ${fileName} (${buffer.length} bytes)`);
+            console.log(`✓ Downloaded: ${fileName}`);
         } catch (error) {
             console.error(`✗ Download failed: ${fileName}:`, error.message);
+        } finally {
+            // A5 fix: Wait for filesystem events to settle, then remove from tracking set
+            setTimeout(() => {
+                this.downloadingPaths.delete(localPath);
+            }, 2000);
         }
     }
 
@@ -903,6 +1079,8 @@ class SyncEngine extends EventEmitter {
 
     async handleFileAdd(filePath) {
         if (this.paused) return;
+        if (this.downloadingPaths.has(filePath)) return; // A5 fix
+        if (this._isExcluded(filePath)) return; // E1: selective sync
         
         const fileName = path.basename(filePath);
         console.log('📁 File added:', fileName);
@@ -911,6 +1089,8 @@ class SyncEngine extends EventEmitter {
 
     async handleFileChange(filePath) {
         if (this.paused) return;
+        if (this.downloadingPaths.has(filePath)) return; // A5 fix
+        if (this._isExcluded(filePath)) return; // E1: selective sync
         
         const fileName = path.basename(filePath);
         console.log('📝 File changed:', fileName);
@@ -919,6 +1099,8 @@ class SyncEngine extends EventEmitter {
 
     async handleFileDelete(filePath) {
         if (this.paused) return;
+        if (this.downloadingPaths.has(filePath)) return; // A5 fix
+        if (this._isExcluded(filePath)) return; // E1: selective sync
         
         const fileName = path.basename(filePath);
         console.log('🗑️  File deleted:', fileName);
@@ -926,9 +1108,40 @@ class SyncEngine extends EventEmitter {
     }
 
     addToQueue(item) {
+        // A1 fix: Add timestamp and depth for ordered processing
+        const relativePath = path.relative(this.syncFolder, item.path);
+        item.timestamp = item.timestamp || Date.now();
+        item.depth = relativePath.split(path.sep).length;
+        
+        // Deduplicate: remove existing queue entry for same path
+        this.syncQueue = this.syncQueue.filter(q => q.path !== item.path);
         this.syncQueue.push(item);
+        this._saveQueue(); // A2: persist queue for crash recovery
+        
         console.log(`Queue: ${this.syncQueue.length} items pending`);
         this.processQueue();
+    }
+
+    _sortQueue() {
+        // A1 fix: Sort queue for deterministic processing order
+        // 1. Directories (lower depth) before files (higher depth) — ensures parent folders exist
+        // 2. Within same depth, sort by timestamp (oldest first — FIFO)
+        // 3. Deletes processed last (reverse depth order — deepest first)
+        this.syncQueue.sort((a, b) => {
+            // Deletes go after adds/changes
+            if (a.type === 'delete' && b.type !== 'delete') return 1;
+            if (a.type !== 'delete' && b.type === 'delete') return -1;
+            
+            // For deletes: deepest first (reverse depth)
+            if (a.type === 'delete' && b.type === 'delete') {
+                if (a.depth !== b.depth) return b.depth - a.depth;
+                return a.timestamp - b.timestamp;
+            }
+            
+            // For adds/changes: shallowest first, then by timestamp
+            if (a.depth !== b.depth) return a.depth - b.depth;
+            return a.timestamp - b.timestamp;
+        });
     }
 
     async processQueue() {
@@ -940,36 +1153,75 @@ class SyncEngine extends EventEmitter {
         this.emit('status-changed');
 
         while (this.syncQueue.length > 0) {
-            const item = this.syncQueue.shift();
-            const fileName = path.basename(item.path);
+            // A1 fix: Sort before each batch to account for items added during processing
+            this._sortQueue();
+
+            // C4: Take a batch of items up to maxConcurrency, respecting depth ordering
+            // Items at the same depth can run concurrently; deeper items wait
+            const batch = [];
+            let batchDepth = null;
             
-            console.log(`\n${'='.repeat(50)}`);
-            console.log(`Processing: ${fileName}`);
-            console.log(`Action: ${item.type.toUpperCase()}`);
-            console.log(`Pending: ${this.syncQueue.length} items`);
-            console.log('='.repeat(50));
-            
-            try {
-                switch (item.type) {
-                    case 'add':
-                    case 'change':
-                        await this.uploadFile(item.path);
-                        console.log(`✓ ${fileName} uploaded successfully`);
-                        break;
-                    case 'delete':
-                        await this.deleteFile(item.path);
-                        console.log(`✓ ${fileName} deleted from server`);
-                        break;
+            while (batch.length < this.maxConcurrency && this.syncQueue.length > 0) {
+                const next = this.syncQueue[0];
+                if (batchDepth === null) {
+                    batchDepth = next.depth;
                 }
-            } catch (error) {
-                console.error(`✗ Error with ${fileName}:`, error.message);
+                // Only batch items at the same depth to preserve parent-before-child ordering
+                if (next.depth !== batchDepth) break;
+                batch.push(this.syncQueue.shift());
             }
+
+            // C4: Process batch concurrently
+            const results = await Promise.allSettled(
+                batch.map(item => this._processItem(item))
+            );
+
+            // C4: Handle retries for failed items
+            for (let i = 0; i < results.length; i++) {
+                if (results[i].status === 'rejected') {
+                    const item = batch[i];
+                    item._retries = (item._retries || 0) + 1;
+                    if (item._retries < this.maxRetries) {
+                        const backoffMs = Math.min(1000 * Math.pow(2, item._retries), 30000);
+                        console.log(`⟳ Retry ${item._retries}/${this.maxRetries} for ${path.basename(item.path)} in ${backoffMs}ms`);
+                        await new Promise(r => setTimeout(r, backoffMs));
+                        this.syncQueue.push(item);
+                    } else {
+                        console.error(`✗ Gave up on ${path.basename(item.path)} after ${this.maxRetries} retries`);
+                    }
+                }
+            }
+            
+            this._saveQueue(); // A2: update persisted queue after each batch
         }
 
         this.processing = false;
         this._saveFileMap();
+        this._clearPersistedQueue(); // A2: queue fully processed, clear persisted copy
         this.emit('status-changed');
         console.log('\n✓ Sync queue completed\n');
+    }
+
+    async _processItem(item) {
+        const fileName = path.basename(item.path);
+        
+        console.log(`\n${'='.repeat(50)}`);
+        console.log(`Processing: ${fileName}`);
+        console.log(`Action: ${item.type.toUpperCase()}`);
+        console.log(`Pending: ${this.syncQueue.length} items`);
+        console.log('='.repeat(50));
+        
+        switch (item.type) {
+            case 'add':
+            case 'change':
+                await this.uploadFile(item.path);
+                console.log(`✓ ${fileName} uploaded successfully`);
+                break;
+            case 'delete':
+                await this.deleteFile(item.path);
+                console.log(`✓ ${fileName} deleted from server`);
+                break;
+        }
     }
 
     async uploadFile(filePath) {
@@ -994,7 +1246,7 @@ class SyncEngine extends EventEmitter {
                 this.activityHistory.startTransfer(transfer.id);
             }
             
-            const fileBuffer = await fs.readFile(filePath);
+            // A3 fix: Use streaming for files instead of loading entire file into memory
             const FormData = require('form-data');
             const form = new FormData();
             
@@ -1010,7 +1262,14 @@ class SyncEngine extends EventEmitter {
                 console.log(`      📂 folder_id obtenido: ${folderId}`);
             }
             
-            form.append('file', fileBuffer, fileName);
+            // A3 fix: Stream file instead of readFile to avoid OOM on large files
+            // E2: Apply upload bandwidth throttling if configured
+            let fileStream = fsSync.createReadStream(filePath);
+            if (this.uploadBandwidthLimit && this.uploadBandwidthLimit > 0) {
+                const throttle = new ThrottleTransform(this.uploadBandwidthLimit);
+                fileStream = fileStream.pipe(throttle);
+            }
+            form.append('file', fileStream, { filename: fileName, knownLength: stats.size });
             form.append('workspace_id', this.workspaceId.toString());
             form.append('name', fileName);
             
@@ -1024,21 +1283,23 @@ class SyncEngine extends EventEmitter {
 
             const fileId = this.fileMap.get(filePath);
             
-            // Update progress to 50% after preparing data
-            if (transfer && this.activityHistory) {
-                this.activityHistory.updateTransferProgress(transfer.id, 50);
-            }
+            // D3 improvement: Real upload progress via axios onUploadProgress
+            const uploadConfig = {
+                headers: form.getHeaders(),
+                onUploadProgress: (progressEvent) => {
+                    if (transfer && this.activityHistory && progressEvent.total) {
+                        const percent = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+                        this.activityHistory.updateTransferProgress(transfer.id, percent, progressEvent.loaded);
+                    }
+                }
+            };
             
             if (fileId) {
                 // Usar PUT para actualizar archivos existentes
-                const response = await this.apiRequest('put', `/api/external/files/${fileId}`, form, {
-                    headers: form.getHeaders()
-                });
+                const response = await this.apiRequest('put', `/api/external/files/${fileId}`, form, uploadConfig);
             } else {
                 // Usar POST para crear nuevos archivos
-                const response = await this.apiRequest('post', '/api/external/files', form, {
-                    headers: form.getHeaders()
-                });
+                const response = await this.apiRequest('post', '/api/external/files', form, uploadConfig);
                 
                 if (response.data.id) {
                     this.fileMap.set(filePath, response.data.id);
