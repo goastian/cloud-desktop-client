@@ -32,5 +32,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Vue renderer
+src/renderer-vue/node_modules/
+dist-renderer/
+
 # Electron builder
 electron-builder.yml
