@@ -30,6 +30,7 @@
   <!-- Global UI -->
   <ToastContainer />
   <ConfirmModal />
+  <ConflictModal />
 </template>
 
 <script setup>
@@ -45,6 +46,7 @@ import DashboardView from '@/components/dashboard/DashboardView.vue'
 import Spinner from '@/components/ui/Spinner.vue'
 import ToastContainer from '@/components/ui/ToastContainer.vue'
 import ConfirmModal from '@/components/ui/ConfirmModal.vue'
+import ConflictModal from '@/components/ui/ConflictModal.vue'
 
 const { currentView, setupStep, init, setupListeners, teardownListeners } = useApp()
 
