@@ -88,10 +88,27 @@ class EnvironmentConfig {
     }
 
     /**
-     * Get the production server URL (hardcoded)
+     * Get the production server URL
      */
     getProductionUrl() {
-        return HARDCODED_SERVER_URL;
+        return this.store.get('productionUrl', HARDCODED_SERVER_URL);
+    }
+
+    /**
+     * Set the production server URL
+     * @param {string} url - The new production server URL
+     * @returns {string} The saved URL
+     */
+    setProductionUrl(url) {
+        if (!url || typeof url !== 'string') {
+            throw new Error('Invalid URL');
+        }
+        const trimmed = url.replace(/\/+$/, '');
+        this.store.set('productionUrl', trimmed);
+        if (this.isProduction()) {
+            this.store.set('serverUrl', trimmed);
+        }
+        return trimmed;
     }
 
     /**
