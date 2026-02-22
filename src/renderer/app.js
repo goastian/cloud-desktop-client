@@ -1,4 +1,55 @@
-const { ipcRenderer } = require('electron');
+// IPC is now exposed via contextBridge (preload.js)
+const electronAPI = window.electronAPI;
+
+// HTML escape utility to prevent XSS in innerHTML interpolations (B4 fix)
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    const s = String(str);
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+    return s.replace(/[&<>"']/g, c => map[c]);
+}
+
+// D2: Toast notification system
+const TOAST_ICONS = { success: '✓', error: '✗', warning: '⚠', info: 'ℹ' };
+
+function showToast(message, type = 'info', duration = 3500) {
+    const container = document.getElementById('toastContainer');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `
+        <span class="toast-icon">${TOAST_ICONS[type] || TOAST_ICONS.info}</span>
+        <span class="toast-body">${escapeHtml(message)}</span>
+        <button class="toast-close" onclick="this.parentElement.classList.add('removing');setTimeout(()=>this.parentElement.remove(),250)">×</button>
+    `;
+    container.appendChild(toast);
+    setTimeout(() => {
+        if (toast.parentElement) {
+            toast.classList.add('removing');
+            setTimeout(() => toast.remove(), 250);
+        }
+    }, duration);
+}
+
+function showConfirm(message, { title = 'Confirmar', confirmText = 'Confirmar', danger = false } = {}) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-box">
+                <h3>${escapeHtml(title)}</h3>
+                <p>${escapeHtml(message)}</p>
+                <div class="modal-actions">
+                    <button class="modal-btn-cancel" id="modalCancel">Cancelar</button>
+                    <button class="${danger ? 'modal-btn-danger' : 'modal-btn-confirm'}" id="modalConfirm">${escapeHtml(confirmText)}</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.querySelector('#modalCancel').addEventListener('click', () => { overlay.remove(); resolve(false); });
+        overlay.querySelector('#modalConfirm').addEventListener('click', () => { overlay.remove(); resolve(true); });
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) { overlay.remove(); resolve(false); } });
+    });
+}
 
 let currentStep = 'server';
 let setupFolders = [];
@@ -17,7 +68,7 @@ let storageUpdateInterval = null;
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
-    const config = await ipcRenderer.invoke('get-config');
+    const config = await electronAPI.invoke('get-config');
     
     deviceInfo = config.device;
     syncFolders = config.syncFolders || [];
@@ -25,7 +76,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     environmentConfig = config.environment || {};
     
     // Check if running in dev mode (passed from main process)
-    isDevMode = await ipcRenderer.invoke('is-dev-mode');
+    isDevMode = await electronAPI.invoke('is-dev-mode');
     
     // Show dev controls only in dev mode
     showDevControls(isDevMode);
@@ -49,8 +100,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupTabListeners();
     
     // Listen for sync status changes from main process
-    ipcRenderer.on('sync-status-changed', (event, data) => {
+    electronAPI.on('sync-status-changed', (data) => {
         updateSyncStatus(data);
+    });
+    
+    // Listen for network status changes
+    electronAPI.on('network-status-changed', (data) => {
+        updateNetworkStatus(data.online);
     });
 });
 
@@ -68,7 +124,7 @@ function setupEventListeners() {
         btn.disabled = true;
         btn.textContent = 'Connecting...';
         
-        await ipcRenderer.invoke('set-server-url', serverUrl);
+        await electronAPI.invoke('set-server-url', serverUrl);
         
         btn.disabled = false;
         btn.textContent = 'Connect';
@@ -81,9 +137,9 @@ function setupEventListeners() {
     if (envToggle) {
         envToggle.addEventListener('change', async (e) => {
             const env = e.target.checked ? 'development' : 'production';
-            const result = await ipcRenderer.invoke('set-environment', env);
+            const result = await electronAPI.invoke('set-environment', env);
             if (result.success) {
-                environmentConfig = await ipcRenderer.invoke('get-environment');
+                environmentConfig = await electronAPI.invoke('get-environment');
                 updateServerUrlInput({ serverUrl: result.serverUrl, environment: environmentConfig });
             }
         });
@@ -117,14 +173,14 @@ function setupEventListeners() {
         
         hideEmailMessages();
         
-        const result = await ipcRenderer.invoke('validate-user-email', email);
+        const result = await electronAPI.invoke('validate-user-email', email);
         
         btn.disabled = false;
         btn.textContent = 'Continue';
         
         if (result.success) {
             if (result.exists) {
-                const codeResult = await ipcRenderer.invoke('generate-pairing-code', email);
+                const codeResult = await electronAPI.invoke('generate-pairing-code', email);
                 
                 if (codeResult.success) {
                     showStep('code');
@@ -141,7 +197,7 @@ function setupEventListeners() {
                 document.getElementById('linkRegister').addEventListener('click', async (e) => {
                     e.preventDefault();
                     const serverUrl = document.getElementById('serverUrl').value.trim();
-                    await ipcRenderer.invoke('open-external', `${serverUrl}/register`);
+                    await electronAPI.invoke('open-external', `${serverUrl}/register`);
                 });
             }
         } else {
@@ -160,8 +216,8 @@ function setupEventListeners() {
         const deviceName = document.getElementById('deviceName').value.trim();
         
         if (deviceName) {
-            await ipcRenderer.invoke('set-device-name', deviceName);
-            deviceInfo = await ipcRenderer.invoke('get-device-info');
+            await electronAPI.invoke('set-device-name', deviceName);
+            deviceInfo = await electronAPI.invoke('get-device-info');
         }
         
         showStep('folder');
@@ -178,7 +234,7 @@ function setupEventListeners() {
         btn.disabled = true;
         btn.textContent = 'Iniciando...';
         
-        const result = await ipcRenderer.invoke('start-all-syncs');
+        const result = await electronAPI.invoke('start-all-syncs');
         
         if (result.success) {
             showDashboard();
@@ -201,7 +257,7 @@ function setupEventListeners() {
     document.getElementById('btnSaveDeviceName').addEventListener('click', async () => {
         const name = document.getElementById('settingsDeviceName').value.trim();
         if (name) {
-            const result = await ipcRenderer.invoke('set-device-name', name);
+            const result = await electronAPI.invoke('set-device-name', name);
             if (result.success) {
                 deviceInfo = result.device;
                 // Update device name in header immediately
@@ -215,19 +271,20 @@ function setupEventListeners() {
     });
     
     document.getElementById('btnLogout').addEventListener('click', async () => {
-        if (confirm('¿Estás seguro de cerrar sesión? La sincronización se detendrá.')) {
-            await ipcRenderer.invoke('logout');
+        const ok = await showConfirm('¿Estás seguro de cerrar sesión? La sincronización se detendrá.', { title: 'Cerrar sesión', confirmText: 'Cerrar sesión', danger: true });
+        if (ok) {
+            await electronAPI.invoke('logout');
         }
     });
     
     document.getElementById('btnOpenWebApp').addEventListener('click', async () => {
-        const config = await ipcRenderer.invoke('get-config');
-        await ipcRenderer.invoke('open-external', config.serverUrl);
+        const config = await electronAPI.invoke('get-config');
+        await electronAPI.invoke('open-external', config.serverUrl);
     });
     
     // Upgrade Plan button
     document.getElementById('btnUpgradePlan').addEventListener('click', async () => {
-        await ipcRenderer.invoke('open-external', 'https://cloud2.astian.org/upgrade');
+        await electronAPI.invoke('open-external', 'https://cloud2.astian.org/upgrade');
     });
     
     // Settings: Environment
@@ -235,11 +292,11 @@ function setupEventListeners() {
     if (settingsEnvToggle) {
         settingsEnvToggle.addEventListener('change', async (e) => {
             const env = e.target.checked ? 'development' : 'production';
-            const result = await ipcRenderer.invoke('set-environment', env);
+            const result = await electronAPI.invoke('set-environment', env);
             if (result.success) {
-                environmentConfig = await ipcRenderer.invoke('get-environment');
+                environmentConfig = await electronAPI.invoke('get-environment');
                 updateEnvironmentUI();
-                alert(`Entorno cambiado a: ${env === 'development' ? 'Desarrollo' : 'Producción'}\nURL: ${result.serverUrl}`);
+                showToast(`Entorno cambiado a: ${env === 'development' ? 'Desarrollo' : 'Producción'} — ${result.serverUrl}`, 'success');
             }
         });
     }
@@ -249,16 +306,16 @@ function setupEventListeners() {
         btnSaveProductionUrl.addEventListener('click', async () => {
             const url = document.getElementById('settingsProductionUrl').value.trim();
             if (!url) {
-                alert('Por favor ingresa una URL válida');
+                showToast('Por favor ingresa una URL válida', 'warning');
                 return;
             }
-            const result = await ipcRenderer.invoke('set-production-url', url);
+            const result = await electronAPI.invoke('set-production-url', url);
             if (result.success) {
-                environmentConfig = await ipcRenderer.invoke('get-environment');
+                environmentConfig = await electronAPI.invoke('get-environment');
                 updateEnvironmentUI();
-                alert('URL de producción guardada');
+                showToast('URL de producción guardada', 'success');
             } else {
-                alert('Error: ' + result.error);
+                showToast('Error: ' + result.error, 'error');
             }
         });
     }
@@ -269,7 +326,7 @@ function setupEventListeners() {
     // Settings: Sync Mode
     document.querySelectorAll('input[name="syncMode"]').forEach(radio => {
         radio.addEventListener('change', async (e) => {
-            await ipcRenderer.invoke('set-sync-mode', e.target.value);
+            await electronAPI.invoke('set-sync-mode', e.target.value);
         });
     });
     
@@ -277,7 +334,7 @@ function setupEventListeners() {
         const btn = document.getElementById('btnSyncNow');
         btn.disabled = true;
         btn.textContent = 'Synchronizing...';
-        await ipcRenderer.invoke('sync-now');
+        await electronAPI.invoke('sync-now');
         btn.disabled = false;
         btn.textContent = 'Sincronizar Ahora';
         loadActivityHistory();
@@ -291,13 +348,15 @@ function setupEventListeners() {
     
     // Settings: Cache
     document.getElementById('enableCache').addEventListener('change', async (e) => {
-        await ipcRenderer.invoke('set-cache-settings', { enabled: e.target.checked });
+        await electronAPI.invoke('set-cache-settings', { enabled: e.target.checked });
     });
     
     document.getElementById('btnClearCache').addEventListener('click', async () => {
-        if (confirm('¿Limpiar toda la caché offline?')) {
-            await ipcRenderer.invoke('clear-cache');
+        const clearCacheOk = await showConfirm('¿Limpiar toda la caché offline?', { title: 'Limpiar caché', confirmText: 'Limpiar', danger: true });
+        if (clearCacheOk) {
+            await electronAPI.invoke('clear-cache');
             loadCacheStats();
+            showToast('Caché limpiada', 'success');
         }
     });
     
@@ -308,9 +367,11 @@ function setupEventListeners() {
     });
     document.getElementById('activityFilter').addEventListener('change', loadActivityHistory);
     document.getElementById('btnClearActivity').addEventListener('click', async () => {
-        if (confirm('¿Clear all activity history?')) {
-            await ipcRenderer.invoke('clear-activity-history');
+        const clearActivityOk = await showConfirm('¿Limpiar todo el historial de actividad?', { title: 'Limpiar historial', confirmText: 'Limpiar', danger: true });
+        if (clearActivityOk) {
+            await electronAPI.invoke('clear-activity-history');
             loadActivityHistory();
+            showToast('Historial limpiado', 'success');
         }
     });
     document.getElementById('btnExportActivity').addEventListener('click', exportActivityHistory);
@@ -337,9 +398,11 @@ async function startPairingCheck(code) {
     document.getElementById('pairingCode').textContent = code;
     
     let attempts = 0;
-    const maxAttempts = 60;
+    const maxAttempts = 30; // B7: Fewer attempts with backoff covers ~5 min total
+    let currentDelay = 3000; // B7: Start at 3s
+    const maxDelay = 15000;  // B7: Cap at 15s
     
-    pairingCheckInterval = setInterval(async () => {
+    async function poll() {
         attempts++;
         
         if (attempts > maxAttempts) {
@@ -348,24 +411,29 @@ async function startPairingCheck(code) {
             return;
         }
         
-        const result = await ipcRenderer.invoke('verify-pairing-code', code);
+        const result = await electronAPI.invoke('verify-pairing-code', code);
         
         if (result.success) {
             stopPairingCheck();
-            // Load device info and go to device setup
-            deviceInfo = await ipcRenderer.invoke('get-device-info');
+            deviceInfo = await electronAPI.invoke('get-device-info');
             document.getElementById('deviceName').value = deviceInfo.name || '';
             showStep('device-setup');
         } else if (result.error && !result.error.includes('not found') && !result.error.includes('not approved')) {
             stopPairingCheck();
             showCodeError(result.error);
+        } else {
+            // B7: Exponential backoff — increase delay each attempt
+            currentDelay = Math.min(currentDelay * 1.3, maxDelay);
+            pairingCheckInterval = setTimeout(poll, currentDelay);
         }
-    }, 5000);
+    }
+    
+    pairingCheckInterval = setTimeout(poll, currentDelay);
 }
 
 function stopPairingCheck() {
     if (pairingCheckInterval) {
-        clearInterval(pairingCheckInterval);
+        clearTimeout(pairingCheckInterval);
         pairingCheckInterval = null;
     }
 }
@@ -396,7 +464,7 @@ async function showDashboard() {
     document.getElementById('dashboard').classList.add('show');
     
     // Load data
-    const config = await ipcRenderer.invoke('get-config');
+    const config = await electronAPI.invoke('get-config');
     deviceInfo = config.device;
     syncFolders = config.syncFolders || [];
     backupFolders = config.backupFolders || [];
@@ -427,7 +495,7 @@ async function showDashboard() {
     startStoragePolling();
     
     // Initialize offline cache
-    await ipcRenderer.invoke('init-offline-cache');
+    await electronAPI.invoke('init-offline-cache');
 }
 
 function updateDeviceCard() {
@@ -442,11 +510,11 @@ function updateDeviceCard() {
 // ============================================
 
 async function addSyncFolderToSetup() {
-    const result = await ipcRenderer.invoke('add-sync-folder');
+    const result = await electronAPI.invoke('add-sync-folder');
     
     if (result.success && !result.canceled) {
         setupFolders.push(result.folder);
-        syncFolders = await ipcRenderer.invoke('get-sync-folders');
+        syncFolders = await electronAPI.invoke('get-sync-folders');
         renderSetupFolderList();
         document.getElementById('btnStartSync').disabled = setupFolders.length === 0;
     }
@@ -467,15 +535,15 @@ function renderSetupFolderList() {
     }
     
     container.innerHTML = syncFolders.map(folder => `
-        <div class="folder-item" data-id="${folder.id}">
+        <div class="folder-item" data-id="${escapeHtml(folder.id)}">
             <div class="folder-icon">📁</div>
             <div class="folder-details">
-                <div class="folder-name">${folder.name}</div>
-                <div class="folder-path">${folder.path}</div>
+                <div class="folder-name">${escapeHtml(folder.name)}</div>
+                <div class="folder-path">${escapeHtml(folder.path)}</div>
                 <div class="folder-stats">${formatBytes(folder.totalSize || 0)} • ${folder.fileCount || 0} files</div>
             </div>
             <div class="folder-actions">
-                <button class="btn-small btn-danger" onclick="removeSetupFolder('${folder.id}')">✕</button>
+                <button class="btn-small btn-danger" onclick="removeSetupFolder('${escapeHtml(folder.id)}')">✕</button>
             </div>
         </div>
     `).join('');
@@ -484,21 +552,21 @@ function renderSetupFolderList() {
 }
 
 async function removeSetupFolder(folderId) {
-    await ipcRenderer.invoke('remove-sync-folder', folderId);
-    syncFolders = await ipcRenderer.invoke('get-sync-folders');
+    await electronAPI.invoke('remove-sync-folder', folderId);
+    syncFolders = await electronAPI.invoke('get-sync-folders');
     setupFolders = setupFolders.filter(f => f.id !== folderId);
     renderSetupFolderList();
 }
 
 async function addSyncFolder() {
-    const result = await ipcRenderer.invoke('add-sync-folder');
+    const result = await electronAPI.invoke('add-sync-folder');
     
     if (result.success && !result.canceled) {
-        syncFolders = await ipcRenderer.invoke('get-sync-folders');
+        syncFolders = await electronAPI.invoke('get-sync-folders');
         renderSyncFolderList();
         
         // Start sync for the new folder
-        await ipcRenderer.invoke('toggle-sync-folder', result.folder.id);
+        await electronAPI.invoke('toggle-sync-folder', result.folder.id);
     }
 }
 
@@ -517,38 +585,40 @@ function renderSyncFolderList() {
     }
     
     container.innerHTML = syncFolders.map(folder => `
-        <div class="folder-item" data-id="${folder.id}">
+        <div class="folder-item" data-id="${escapeHtml(folder.id)}">
             <div class="folder-icon">📁</div>
             <div class="folder-details">
-                <div class="folder-name">${folder.name}</div>
-                <div class="folder-path">${folder.path}</div>
+                <div class="folder-name">${escapeHtml(folder.name)}</div>
+                <div class="folder-path">${escapeHtml(folder.path)}</div>
                 <div class="folder-stats">
                     ${formatBytes(folder.totalSize || 0)} • ${folder.fileCount || 0} archivos
-                    <span class="status-badge status-${folder.status || 'pending'}">${getStatusText(folder.status)}</span>
+                    <span class="status-badge status-${escapeHtml(folder.status || 'pending')}">${getStatusText(folder.status)}</span>
                 </div>
             </div>
             <div class="folder-actions">
                 <label class="toggle-switch">
-                    <input type="checkbox" ${folder.enabled ? 'checked' : ''} onchange="toggleSyncFolder('${folder.id}')">
+                    <input type="checkbox" ${folder.enabled ? 'checked' : ''} onchange="toggleSyncFolder('${escapeHtml(folder.id)}')">
                     <span class="toggle-slider"></span>
                 </label>
-                <button class="btn-small btn-danger" onclick="removeSyncFolder('${folder.id}')">✕</button>
+                <button class="btn-small btn-danger" onclick="removeSyncFolder('${escapeHtml(folder.id)}')">✕</button>
             </div>
         </div>
     `).join('');
 }
 
 async function toggleSyncFolder(folderId) {
-    await ipcRenderer.invoke('toggle-sync-folder', folderId);
-    syncFolders = await ipcRenderer.invoke('get-sync-folders');
+    await electronAPI.invoke('toggle-sync-folder', folderId);
+    syncFolders = await electronAPI.invoke('get-sync-folders');
     renderSyncFolderList();
 }
 
 async function removeSyncFolder(folderId) {
-    if (confirm('¿Eliminar esta carpeta de la sincronización?')) {
-        await ipcRenderer.invoke('remove-sync-folder', folderId);
-        syncFolders = await ipcRenderer.invoke('get-sync-folders');
+    const ok = await showConfirm('¿Eliminar esta carpeta de la sincronización?', { title: 'Eliminar carpeta', confirmText: 'Eliminar', danger: true });
+    if (ok) {
+        await electronAPI.invoke('remove-sync-folder', folderId);
+        syncFolders = await electronAPI.invoke('get-sync-folders');
         renderSyncFolderList();
+        showToast('Carpeta eliminada de la sincronización', 'success');
     }
 }
 
@@ -557,10 +627,10 @@ async function removeSyncFolder(folderId) {
 // ============================================
 
 async function addBackupFolder() {
-    const result = await ipcRenderer.invoke('add-backup-folder');
+    const result = await electronAPI.invoke('add-backup-folder');
     
     if (result.success && !result.canceled) {
-        backupFolders = await ipcRenderer.invoke('get-backup-folders');
+        backupFolders = await electronAPI.invoke('get-backup-folders');
         renderBackupFolderList();
     }
 }
@@ -580,41 +650,43 @@ function renderBackupFolderList() {
     }
     
     container.innerHTML = backupFolders.map(folder => `
-        <div class="folder-item" data-id="${folder.id}">
+        <div class="folder-item" data-id="${escapeHtml(folder.id)}">
             <div class="folder-icon">💾</div>
             <div class="folder-details">
-                <div class="folder-name">${folder.name}</div>
-                <div class="folder-path">${folder.path}</div>
+                <div class="folder-name">${escapeHtml(folder.name)}</div>
+                <div class="folder-path">${escapeHtml(folder.path)}</div>
                 <div class="folder-stats">
                     ${formatBytes(folder.totalSize || 0)} • ${folder.fileCount || 0} files
                     ${folder.lastBackup ? `• Last: ${formatDate(folder.lastBackup)}` : ''}
                 </div>
             </div>
             <div class="folder-actions">
-                <button class="btn-small btn-success" onclick="startBackup('${folder.id}')" title="Iniciar backup">↑</button>
-                <button class="btn-small btn-danger" onclick="removeBackupFolder('${folder.id}')">✕</button>
+                <button class="btn-small btn-success" onclick="startBackup('${escapeHtml(folder.id)}')" title="Iniciar backup">↑</button>
+                <button class="btn-small btn-danger" onclick="removeBackupFolder('${escapeHtml(folder.id)}')">✕</button>
             </div>
         </div>
     `).join('');
 }
 
 async function startBackup(folderId) {
-    const result = await ipcRenderer.invoke('start-backup', folderId);
+    const result = await electronAPI.invoke('start-backup', folderId);
     
     if (result.success) {
-        alert(`Backup completado: ${result.uploaded} archivos subidos`);
-        backupFolders = await ipcRenderer.invoke('get-backup-folders');
+        showToast(`Backup completado: ${result.uploaded} archivos subidos`, 'success');
+        backupFolders = await electronAPI.invoke('get-backup-folders');
         renderBackupFolderList();
     } else {
-        alert('Error en backup: ' + result.error);
+        showToast('Error en backup: ' + result.error, 'error');
     }
 }
 
 async function removeBackupFolder(folderId) {
-    if (confirm('¿Eliminar esta carpeta del backup?')) {
-        await ipcRenderer.invoke('remove-backup-folder', folderId);
-        backupFolders = await ipcRenderer.invoke('get-backup-folders');
+    const ok = await showConfirm('¿Eliminar esta carpeta del backup?', { title: 'Eliminar backup', confirmText: 'Eliminar', danger: true });
+    if (ok) {
+        await electronAPI.invoke('remove-backup-folder', folderId);
+        backupFolders = await electronAPI.invoke('get-backup-folders');
         renderBackupFolderList();
+        showToast('Carpeta de backup eliminada', 'success');
     }
 }
 
@@ -745,14 +817,32 @@ function updateSyncStatus(data) {
 }
 
 // ============================================
+// Network Status
+// ============================================
+
+function updateNetworkStatus(online) {
+    const indicator = document.getElementById('syncIndicator');
+    const text = document.getElementById('syncStatusText');
+    
+    if (!online) {
+        indicator.classList.remove('syncing');
+        indicator.classList.add('offline');
+        text.textContent = 'Offline — sync paused';
+    } else {
+        indicator.classList.remove('offline');
+        text.textContent = 'Reconnected — resuming sync';
+    }
+}
+
+// ============================================
 // Settings Management
 // ============================================
 
 async function loadSettings() {
-    settings = await ipcRenderer.invoke('get-settings');
+    settings = await electronAPI.invoke('get-settings');
     
     // Bandwidth limits
-    const limits = await ipcRenderer.invoke('get-bandwidth-limits');
+    const limits = await electronAPI.invoke('get-bandwidth-limits');
     updateBandwidthUI(limits);
     
     // Sync mode
@@ -810,13 +900,13 @@ async function saveBandwidthLimits() {
     if (downloadUnit === 'KB') downloadBytes = downloadValue * 1024;
     else if (downloadUnit === 'MB') downloadBytes = downloadValue * 1024 * 1024;
     
-    const result = await ipcRenderer.invoke('set-bandwidth-limits', {
+    const result = await electronAPI.invoke('set-bandwidth-limits', {
         upload: uploadBytes,
         download: downloadBytes
     });
     
     if (result.success) {
-        alert('Límites de ancho de banda guardados');
+        showToast('Límites de ancho de banda guardados', 'success');
     }
 }
 
@@ -831,8 +921,8 @@ function renderExclusionPatterns() {
     
     container.innerHTML = patterns.map(pattern => `
         <div class="exclusion-item">
-            <code>${pattern}</code>
-            <button onclick="removeExclusionPattern('${pattern}')">✕</button>
+            <code>${escapeHtml(pattern)}</code>
+            <button onclick="removeExclusionPattern('${escapeHtml(pattern)}')">✕</button>
         </div>
     `).join('');
 }
@@ -843,7 +933,7 @@ async function addExclusionPattern() {
     
     if (!pattern) return;
     
-    const result = await ipcRenderer.invoke('add-excluded-pattern', pattern);
+    const result = await electronAPI.invoke('add-excluded-pattern', pattern);
     if (result.success) {
         settings = result.settings;
         renderExclusionPatterns();
@@ -852,7 +942,7 @@ async function addExclusionPattern() {
 }
 
 async function removeExclusionPattern(pattern) {
-    const result = await ipcRenderer.invoke('remove-excluded-pattern', pattern);
+    const result = await electronAPI.invoke('remove-excluded-pattern', pattern);
     if (result.success) {
         settings = result.settings;
         renderExclusionPatterns();
@@ -871,8 +961,8 @@ async function loadActivityHistory() {
         options.type = filter;
     }
     
-    activityHistory = await ipcRenderer.invoke('get-activity-history', options);
-    const stats = await ipcRenderer.invoke('get-activity-stats');
+    activityHistory = await electronAPI.invoke('get-activity-history', options);
+    const stats = await electronAPI.invoke('get-activity-stats');
     
     // Update stats
     document.getElementById('statUploaded').textContent = stats.byType?.upload || 0;
@@ -899,7 +989,7 @@ function renderActivityList() {
         <div class="activity-item">
             <div class="activity-icon">${getActivityIcon(activity.type)}</div>
             <div class="activity-details">
-                <div class="activity-title">${getActivityDescription(activity)}</div>
+                <div class="activity-title">${escapeHtml(getActivityDescription(activity))}</div>
                 <div class="activity-meta">
                     <span>${formatRelativeTime(activity.timestamp)}</span>
                     ${activity.size ? `<span>${formatBytes(activity.size)}</span>` : ''}
@@ -953,7 +1043,7 @@ function formatRelativeTime(timestamp) {
 }
 
 async function exportActivityHistory() {
-    const data = await ipcRenderer.invoke('export-activity-history');
+    const data = await electronAPI.invoke('export-activity-history');
     const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -968,7 +1058,7 @@ async function exportActivityHistory() {
 // ============================================
 
 async function loadCacheStats() {
-    cacheStats = await ipcRenderer.invoke('get-cache-stats');
+    cacheStats = await electronAPI.invoke('get-cache-stats');
     
     document.getElementById('cacheFileCount').textContent = cacheStats.fileCount || 0;
     document.getElementById('cacheSize').textContent = formatBytes(cacheStats.totalSize || 0);
@@ -1073,7 +1163,7 @@ function showDevControls(show) {
 // ============================================
 
 async function loadStorageStats() {
-    const result = await ipcRenderer.invoke('get-storage-stats');
+    const result = await electronAPI.invoke('get-storage-stats');
     if (result.success) {
         storageStats = {
             used: result.used,
@@ -1138,7 +1228,7 @@ function stopStoragePolling() {
 let activeTransfers = { inProgress: [], pending: [], all: [] };
 
 async function loadActiveTransfers() {
-    activeTransfers = await ipcRenderer.invoke('get-active-transfers');
+    activeTransfers = await electronAPI.invoke('get-active-transfers');
     renderActiveTransfers();
 }
 
@@ -1175,7 +1265,7 @@ function renderTransferItem(transfer) {
         <div class="transfer-item ${statusClass}" data-id="${transfer.id}">
             <div class="transfer-icon">${icon}</div>
             <div class="transfer-details">
-                <div class="transfer-name">${transfer.fileName || 'Unknown file'}</div>
+                <div class="transfer-name">${escapeHtml(transfer.fileName || 'Unknown file')}</div>
                 <div class="transfer-info">
                     ${transfer.size ? `<span>${formatBytes(transfer.size)}</span>` : ''}
                     ${showProgress ? `
@@ -1194,7 +1284,7 @@ function renderTransferItem(transfer) {
 }
 
 async function cancelTransfer(transferId) {
-    const result = await ipcRenderer.invoke('cancel-transfer', transferId);
+    const result = await electronAPI.invoke('cancel-transfer', transferId);
     if (result.success) {
         await loadActiveTransfers();
         await loadActivityHistory();
@@ -1202,22 +1292,28 @@ async function cancelTransfer(transferId) {
 }
 
 async function cancelAllTransfers() {
-    if (confirm('¿Cancel all active transfers?')) {
-        const result = await ipcRenderer.invoke('cancel-all-transfers');
+    const ok = await showConfirm('¿Cancelar todas las transferencias activas?', { title: 'Cancelar transferencias', confirmText: 'Cancelar todo', danger: true });
+    if (ok) {
+        const result = await electronAPI.invoke('cancel-all-transfers');
         if (result.success) {
             await loadActiveTransfers();
+            showToast('Transferencias canceladas', 'success');
             await loadActivityHistory();
         }
     }
 }
 
 // Listen for transfer updates from main process
-ipcRenderer.on('transfers-updated', (event, transfers) => {
+electronAPI.on('transfers-updated', (transfers) => {
     activeTransfers = transfers;
     renderActiveTransfers();
+    // Refresh storage stats when transfers complete (merged from duplicate listener - A6 fix)
+    if (transfers.all.length === 0 || transfers.inProgress.length === 0) {
+        loadStorageStats();
+    }
 });
 
-ipcRenderer.on('transfer-progress', (event, transfer) => {
+electronAPI.on('transfer-progress', (transfer) => {
     // Update specific transfer progress in UI
     const transferEl = document.querySelector(`.transfer-item[data-id="${transfer.id}"]`);
     if (transferEl) {
@@ -1229,12 +1325,8 @@ ipcRenderer.on('transfer-progress', (event, transfer) => {
 });
 
 // Update storage when transfers complete
-ipcRenderer.on('transfers-updated', (event, transfers) => {
-    // If a transfer just completed, refresh storage stats
-    if (transfers.all.length === 0 || transfers.inProgress.length === 0) {
-        loadStorageStats();
-    }
-});
+// NOTE: duplicate transfers-updated listener removed (A6 fix)
+// Storage refresh is now handled in the single listener above
 
 // Make functions globally available for onclick handlers
 window.removeSetupFolder = removeSetupFolder;
