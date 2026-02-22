@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply box-border;
+  }
+  body {
+    @apply m-0 p-0 font-sans antialiased;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply w-full py-3 px-4 rounded-lg text-sm font-semibold cursor-pointer
+           transition-all duration-200 border-none text-center
+           disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none;
+  }
+  .btn-primary {
+    @apply btn bg-gradient-to-br from-brand-500 to-accent-500 text-white
+           hover:-translate-y-0.5 hover:shadow-lg hover:shadow-brand-500/40
+           active:translate-y-0;
+  }
+  .btn-secondary {
+    @apply btn bg-gray-100 text-gray-600
+           hover:bg-gray-200 hover:shadow-none;
+  }
+  .btn-danger {
+    @apply btn bg-red-500 text-white hover:bg-red-600;
+  }
+  .btn-small {
+    @apply py-2 px-3 text-xs w-auto;
+  }
+  .btn-icon {
+    @apply w-7 h-7 p-0 text-xs rounded-md flex items-center justify-center;
+  }
+  .input-field {
+    @apply w-full py-2.5 px-3.5 border-2 border-gray-200 rounded-lg text-sm
+           transition-colors duration-300 bg-white
+           focus:outline-none focus:border-brand-500
+           disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed;
+  }
+  .card {
+    @apply bg-white rounded-2xl shadow-xl w-full max-w-[440px] p-7 max-h-[90vh] overflow-y-auto;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #aaa; }
+
+/* Animations */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-spin-slow { animation: spin 1s linear infinite; }
+.animate-pulse-dot { animation: pulse-dot 1.5s infinite; }
