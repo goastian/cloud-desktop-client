@@ -77,11 +77,14 @@ class EnvironmentConfig {
     }
 
     /**
-     * Get the server URL - always returns hardcoded URL
+     * Get the server URL based on current environment
      */
     getServerUrl() {
-        // Always return hardcoded server URL
-        return HARDCODED_SERVER_URL;
+        const env = this.getEnvironment();
+        if (env === ENVIRONMENTS.DEVELOPMENT) {
+            return DEFAULT_URLS[ENVIRONMENTS.DEVELOPMENT];
+        }
+        return this.store.get('productionUrl', HARDCODED_SERVER_URL);
     }
 
     /**
