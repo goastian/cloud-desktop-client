@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, nativeImage, Notification } = require('electron');
 const path = require('path');
 const Conf = require('conf');
 
@@ -19,26 +19,42 @@ const SettingsManager = require('./settings-manager');
 const ActivityHistory = require('./activity-history');
 const OfflineCache = require('./offline-cache');
 const EnvironmentConfig = require('./environment-config');
+const SecureStorage = require('./secure-storage');
+const NetworkMonitor = require('./network-monitor');
+const AutoUpdater = require('./auto-updater');
 
 const store = new Conf({
     projectName: 'astian-cloud',
     projectSuffix: ''
 });
+const secureStorage = new SecureStorage(store);
 let mainWindow = null;
 let tray = null;
 let syncEngines = new Map(); // Multiple sync engines for multiple folders
 let backupService = null;
 let offlineCache = null;
+let updateTrayMenu = null; // D4: Module-level ref for tray menu updates
+let appAutoUpdater = null; // E4: Module-level ref for auto-updater
+const pendingConflicts = new Map(); // C7: Pending conflict resolutions awaiting user response
 
 // Initialize services
 const environmentConfig = new EnvironmentConfig(store);
-const authService = new AuthService(store, environmentConfig);
+const authService = new AuthService(store, environmentConfig, secureStorage);
 const deviceManager = new DeviceManager(store);
 const syncFoldersManager = new SyncFoldersManager(store);
 const settingsManager = new SettingsManager(store);
 const activityHistory = new ActivityHistory(store);
+const networkMonitor = new NetworkMonitor();
 
 const isDev = process.argv.includes('--dev');
+
+// E3: Native OS notification helper
+function showNativeNotification(title, body, onClick = null) {
+    if (!Notification.isSupported()) return;
+    const notif = new Notification({ title, body, icon: getAssetPath('icon.png') });
+    if (onClick) notif.on('click', onClick);
+    notif.show();
+}
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -50,23 +66,40 @@ function createWindow() {
         minWidth: 400,
         minHeight: 500,
         webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
         },
         icon: getAssetPath(process.platform === 'win32' ? 'icon.ico' : 'icon.png')
     });
 
-    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
-
-    if (isDev) {
+    // Vue + Vite renderer: load dev server in dev mode, built files in production
+    const useVueRenderer = true; // Toggle to switch between old and new renderer
+    if (useVueRenderer && isDev) {
+        mainWindow.loadURL('http://localhost:5173');
         mainWindow.webContents.openDevTools();
+    } else if (useVueRenderer) {
+        const rendererPath = app.isPackaged
+            ? path.join(process.resourcesPath, 'dist-renderer', 'index.html')
+            : path.join(__dirname, '../../dist-renderer/index.html');
+        mainWindow.loadFile(rendererPath);
+    } else {
+        mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+        if (isDev) {
+            mainWindow.webContents.openDevTools();
+        }
     }
 
     mainWindow.on('ready-to-show', () => {
+        // E5: If started with --minimized flag, stay hidden
+        const startMinimized = process.argv.includes('--minimized');
         const isAuthenticated = store.get('authenticated', false);
         if (!isAuthenticated) {
             mainWindow.show();
+        } else if (!startMinimized) {
+            // Authenticated but not minimized — show normally
         }
+        // If startMinimized && authenticated, window stays hidden (tray only)
     });
 
     mainWindow.on('close', (event) => {
@@ -101,10 +134,39 @@ function createTray() {
 
     const updateTrayMenu = () => {
         const isAuthenticated = store.get('authenticated', false);
-        // Fix: Use syncEngines Map instead of undefined syncEngine
         const isSyncing = syncEngines.size > 0 && Array.from(syncEngines.values()).some(e => !e.paused);
+        const isOnline = networkMonitor.isOnline();
         const syncFolders = syncFoldersManager.getSyncFolders();
         const folderCount = syncFolders.length;
+        const activeCount = Array.from(syncEngines.values()).filter(e => e.getStatus().isActive || e.getStatus().processing).length;
+
+        // D4: Dynamic tooltip with real status
+        let tooltip = 'Astian Cloud';
+        if (!isOnline) {
+            tooltip += ' — Offline';
+        } else if (activeCount > 0) {
+            tooltip += ` — Syncing ${activeCount} folder${activeCount !== 1 ? 's' : ''}`;
+        } else if (isSyncing) {
+            tooltip += ' — Up to date';
+        } else {
+            tooltip += ' — Paused';
+        }
+        tray.setToolTip(tooltip);
+
+        // D4: Build folder submenu for quick access
+        const folderSubmenu = syncFolders.map(f => ({
+            label: f.name || f.path,
+            click: () => require('electron').shell.openPath(f.path)
+        }));
+        if (folderSubmenu.length === 0) {
+            folderSubmenu.push({ label: 'No folders configured', enabled: false });
+        }
+
+        // D4: Status label
+        let statusLabel = '✓ Up to date';
+        if (!isOnline) statusLabel = '⚡ Offline';
+        else if (activeCount > 0) statusLabel = `🔄 Syncing (${activeCount})...`;
+        else if (!isSyncing) statusLabel = '⏸ Paused';
 
         const contextMenu = Menu.buildFromTemplate([
             {
@@ -113,27 +175,19 @@ function createTray() {
             },
             { type: 'separator' },
             {
-                label: isAuthenticated ? `✓ Authenticated` : '✗ Not authenticated',
+                label: statusLabel,
                 enabled: false
             },
             {
-                label: isSyncing ? '🔄 Syncing...' : '⏸ Paused',
-                enabled: false
-            },
-            {
-                label: `📁 ${folderCount} carpeta${folderCount !== 1 ? 's' : ''} sincronizada${folderCount !== 1 ? 's' : ''}`,
-                enabled: false
+                label: `📁 ${folderCount} folder${folderCount !== 1 ? 's' : ''}`,
+                submenu: folderSubmenu
             },
             { type: 'separator' },
             {
-                label: 'Open Folder',
+                label: 'Open Dashboard',
                 click: () => {
-                    const folder = store.get('syncFolder');
-                    if (folder) {
-                        require('electron').shell.openPath(folder);
-                    }
-                },
-                enabled: isAuthenticated
+                    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+                }
             },
             {
                 label: 'Open Web App',
@@ -144,9 +198,8 @@ function createTray() {
             },
             { type: 'separator' },
             {
-                label: isSyncing ? 'Pausar Sincronización' : 'Reanudar Sincronización',
+                label: isSyncing ? 'Pause Sync' : 'Resume Sync',
                 click: () => {
-                    // Pause/resume all sync engines
                     for (const [id, engine] of syncEngines) {
                         if (isSyncing) {
                             engine.pause();
@@ -159,22 +212,30 @@ function createTray() {
                 enabled: isAuthenticated && syncEngines.size > 0
             },
             {
-                label: 'Sincronizar Ahora',
+                label: 'Sync Now',
                 click: async () => {
                     for (const [id, engine] of syncEngines) {
                         await engine.syncNow();
                     }
                     activityHistory.addActivity({
                         type: ActivityHistory.TYPES.SYNC_START,
-                        message: 'Sincronización manual iniciada'
+                        message: 'Manual sync started'
                     });
                 },
-                enabled: isAuthenticated && syncEngines.size > 0
+                enabled: isAuthenticated && syncEngines.size > 0 && isOnline
             },
             {
-                label: 'Settings',
+                label: 'Check for Updates',
                 click: () => {
-                    mainWindow.show();
+                    if (appAutoUpdater) {
+                        appAutoUpdater.checkForUpdatesManual();
+                    } else {
+                        dialog.showMessageBox(mainWindow, {
+                            type: 'info',
+                            title: 'Updates',
+                            message: 'Auto-update is only available in packaged builds.',
+                        });
+                    }
                 }
             },
             { type: 'separator' },
@@ -218,18 +279,18 @@ function createTray() {
         }
     });
 
-    tray.setToolTip('Astian Cloud - Desktop Sync');
+    // D4: Tooltip is now set dynamically inside updateTrayMenu()
 
     return updateTrayMenu;
 }
 
 app.whenReady().then(async () => {
     createWindow();
-    const updateTrayMenu = createTray();
+    updateTrayMenu = createTray();
     
     const isAuthenticated = store.get('authenticated', false);
     if (isAuthenticated) {
-        const token = store.get('authToken');
+        const token = secureStorage.getSecure('authToken');
         const serverUrl = environmentConfig.getServerUrl();
         
         // Start sync engines for all enabled sync folders
@@ -259,6 +320,39 @@ app.whenReady().then(async () => {
             }
         }
     }
+    
+    // Start network monitor and wire up online/offline events
+    networkMonitor.start();
+    
+    networkMonitor.on('offline', () => {
+        console.log('[App] Network offline — pausing all sync engines');
+        for (const [id, engine] of syncEngines) {
+            engine.pause();
+        }
+        if (mainWindow) {
+            mainWindow.webContents.send('network-status-changed', { online: false });
+        }
+        showNativeNotification('Network Offline', 'Sync has been paused until connection is restored');
+        if (updateTrayMenu) updateTrayMenu();
+    });
+    
+    networkMonitor.on('online', () => {
+        console.log('[App] Network online — resuming all sync engines');
+        for (const [id, engine] of syncEngines) {
+            engine.resume();
+        }
+        if (mainWindow) {
+            mainWindow.webContents.send('network-status-changed', { online: true });
+        }
+        showNativeNotification('Network Online', 'Sync has been resumed');
+        if (updateTrayMenu) updateTrayMenu();
+    });
+
+    // E4: Auto-update — only in packaged builds
+    if (app.isPackaged) {
+        appAutoUpdater = new AutoUpdater();
+        appAutoUpdater.start(mainWindow);
+    }
 });
 
 app.on('window-all-closed', () => {
@@ -271,6 +365,7 @@ app.on('before-quit', () => {
         engine.stop();
     }
     syncEngines.clear();
+    networkMonitor.stop();
 });
 
 // IPC Handlers
@@ -291,7 +386,7 @@ ipcMain.handle('get-config', async () => {
 // Storage Stats
 ipcMain.handle('get-storage-stats', async () => {
     try {
-        const token = store.get('authToken');
+        const token = secureStorage.getSecure('authToken');
         if (!token) {
             console.log('[Storage] No auth token');
             return { success: false, error: 'Not authenticated' };
@@ -412,7 +507,7 @@ ipcMain.handle('verify-pairing-code', async (event, code) => {
         
         if (result.success && result.token) {
             store.set('authenticated', true);
-            store.set('authToken', result.token);
+            secureStorage.setSecure('authToken', result.token);
             store.delete('pendingCode');
             store.delete('codeGeneratedAt');
             
@@ -443,7 +538,7 @@ ipcMain.handle('select-sync-folder', async () => {
 
 ipcMain.handle('start-sync', async () => {
     try {
-        const token = store.get('authToken');
+        const token = secureStorage.getSecure('authToken');
 
         if (!token) {
             return { success: false, error: 'Not authenticated' };
@@ -482,8 +577,21 @@ ipcMain.handle('logout', async () => {
         engine.stop();
     }
     syncEngines.clear();
+    backupService = null;
     
-    store.clear();
+    // A8 fix: Only clear auth/sync data, preserve device identity and user settings
+    secureStorage.deleteSecure('authToken');
+    store.delete('authenticated');
+    store.delete('pendingCode');
+    store.delete('codeGeneratedAt');
+    store.delete('userEmail');
+    store.delete('email');
+    store.delete('syncFolder');
+    store.delete('syncFolders');
+    store.delete('backupFolders');
+    store.delete('backupHistory');
+    store.delete('activityHistory');
+    // Preserve: deviceId, deviceName, settings, environment, productionUrl
     
     mainWindow.show();
     mainWindow.webContents.reload();
@@ -500,6 +608,16 @@ ipcMain.handle('get-device-info', async () => {
 });
 
 ipcMain.handle('set-device-name', async (event, name) => {
+    try {
+        const device = deviceManager.setDeviceName(name);
+        return { success: true, device };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+// Alias for Vue renderer compatibility
+ipcMain.handle('save-device-name', async (event, name) => {
     try {
         const device = deviceManager.setDeviceName(name);
         return { success: true, device };
@@ -656,7 +774,7 @@ ipcMain.handle('add-backup-folder', async (event, options = {}) => {
         
         // Initialize backup service if needed
         if (!backupService) {
-            const token = store.get('authToken');
+            const token = secureStorage.getSecure('authToken');
             const serverUrl = environmentConfig.getServerUrl();
             backupService = new BackupService(store, token, serverUrl);
         }
@@ -686,7 +804,7 @@ ipcMain.handle('remove-backup-folder', async (event, folderId) => {
 ipcMain.handle('start-backup', async (event, folderId) => {
     try {
         if (!backupService) {
-            const token = store.get('authToken');
+            const token = secureStorage.getSecure('authToken');
             const serverUrl = environmentConfig.getServerUrl();
             backupService = new BackupService(store, token, serverUrl);
         }
@@ -701,7 +819,7 @@ ipcMain.handle('start-backup', async (event, folderId) => {
 ipcMain.handle('toggle-backup-folder', async (event, folderId) => {
     try {
         if (!backupService) {
-            const token = store.get('authToken');
+            const token = secureStorage.getSecure('authToken');
             const serverUrl = environmentConfig.getServerUrl();
             backupService = new BackupService(store, token, serverUrl);
         }
@@ -718,15 +836,18 @@ ipcMain.handle('toggle-backup-folder', async (event, folderId) => {
 // ============================================
 
 async function startSyncForFolder(folder) {
-    const token = store.get('authToken');
+    const token = secureStorage.getSecure('authToken');
     const serverUrl = environmentConfig.getServerUrl();
     
     if (!token) {
         throw new Error('Not authenticated');
     }
     
-    const engine = new SyncEngine(folder.path, token, serverUrl, store, activityHistory);
+    const engine = new SyncEngine(folder.path, token, serverUrl, store, activityHistory, settingsManager);
     engine.folderId = folder.id;
+    
+    // Track previous status for transition-based notifications
+    let prevActive = false;
     
     engine.on('status-changed', () => {
         const status = engine.getStatus();
@@ -737,12 +858,57 @@ async function startSyncForFolder(folder) {
         } else if (status.isActive || status.processing) {
             folderStatus = 'syncing';
         }
+        
+        // E3: Notify when sync completes (was active, now idle)
+        const isActive = status.isActive || status.processing;
+        if (prevActive && !isActive && !status.paused) {
+            showNativeNotification('Sync Complete', `"${folder.name}" is up to date`, () => {
+                if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+            });
+        }
+        prevActive = isActive;
+        
+        // E8: Update taskbar progress bar
+        if (mainWindow) {
+            if (isActive) {
+                // Indeterminate progress while syncing (no exact percentage available)
+                mainWindow.setProgressBar(2, { mode: 'indeterminate' });
+            } else if (status.paused) {
+                mainWindow.setProgressBar(2, { mode: 'paused' });
+            } else {
+                mainWindow.setProgressBar(-1); // Remove progress bar
+            }
+        }
+        
         syncFoldersManager.updateFolderStatus(folder.id, folderStatus);
         if (mainWindow) {
             mainWindow.webContents.send('sync-status-changed', { folderId: folder.id, status });
         }
+        // D4: Update tray menu/tooltip on every status change
+        if (updateTrayMenu) updateTrayMenu();
     });
     
+    // C7: Wire conflict resolver — sends conflict to renderer and waits for response
+    engine.setConflictResolver((conflictInfo) => {
+        return new Promise((resolve) => {
+            if (!mainWindow || mainWindow.isDestroyed()) {
+                resolve('server'); // fallback: server wins
+                return;
+            }
+            const conflictId = `${folder.id}-${Date.now()}`;
+            mainWindow.webContents.send('conflict-detected', { ...conflictInfo, conflictId });
+            // Store resolver so IPC handler can call it
+            pendingConflicts.set(conflictId, resolve);
+            // Timeout: auto-resolve after 60s if user doesn't respond
+            setTimeout(() => {
+                if (pendingConflicts.has(conflictId)) {
+                    pendingConflicts.delete(conflictId);
+                    resolve('server');
+                }
+            }, 60000);
+        });
+    });
+
     syncEngines.set(folder.id, engine);
     await engine.start();
     
@@ -815,6 +981,21 @@ ipcMain.handle('get-settings', async () => {
 ipcMain.handle('update-settings', async (event, updates) => {
     try {
         const settings = settingsManager.updateSettings(updates);
+        
+        // E5: Apply launch on startup setting
+        if ('launchOnStartup' in updates) {
+            app.setLoginItemSettings({
+                openAtLogin: !!updates.launchOnStartup,
+                args: updates.startMinimized ? ['--minimized'] : []
+            });
+        }
+        if ('startMinimized' in updates && settings.launchOnStartup) {
+            app.setLoginItemSettings({
+                openAtLogin: true,
+                args: updates.startMinimized ? ['--minimized'] : []
+            });
+        }
+        
         return { success: true, settings };
     } catch (error) {
         return { success: false, error: error.message };
@@ -878,6 +1059,25 @@ ipcMain.handle('add-excluded-pattern', async (event, pattern) => {
 });
 
 ipcMain.handle('remove-excluded-pattern', async (event, pattern) => {
+    try {
+        const settings = settingsManager.removeExcludedPattern(pattern);
+        return { success: true, settings };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+// Aliases for Vue renderer compatibility
+ipcMain.handle('add-exclusion-pattern', async (event, pattern) => {
+    try {
+        const settings = settingsManager.addExcludedPattern(pattern);
+        return { success: true, settings };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+ipcMain.handle('remove-exclusion-pattern', async (event, pattern) => {
     try {
         const settings = settingsManager.removeExcludedPattern(pattern);
         return { success: true, settings };
@@ -1048,6 +1248,20 @@ ipcMain.handle('set-cache-settings', async (event, options) => {
     } catch (error) {
         return { success: false, error: error.message };
     }
+});
+
+// ============================================
+// C7: Conflict Resolution IPC Handler
+// ============================================
+
+ipcMain.handle('resolve-conflict', async (event, conflictId, resolution) => {
+    const resolver = pendingConflicts.get(conflictId);
+    if (resolver) {
+        pendingConflicts.delete(conflictId);
+        resolver(resolution); // 'server', 'local', 'both', or 'skip'
+        return { success: true };
+    }
+    return { success: false, error: 'Conflict not found or already resolved' };
 });
 
 // ============================================

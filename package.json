@@ -1,11 +1,15 @@
 {
   "name": "astian-cloud-desktop",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Astian Cloud Desktop Sync Client",
   "main": "src/main/index.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --dev",
+    "dev:renderer": "cd src/renderer-vue && npm run dev",
+    "dev:electron": "electron . --dev",
+    "dev": "concurrently -n vue,electron \"npm run dev:renderer\" \"npm run dev:electron\"",
+    "build:renderer": "cd src/renderer-vue && npm run build",
+    "prebuild": "npm run build:renderer",
     "build": "electron-builder",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win",
@@ -29,9 +33,11 @@
     "chokidar": "3.5.3",
     "conf": "10.1.2",
     "form-data": "4.0.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "electron-updater": "^6.1.7"
   },
   "devDependencies": {
+    "concurrently": "^8.2.2",
     "electron": "25.9.0",
     "electron-builder": "24.6.4"
   },
@@ -42,8 +48,15 @@
       "output": "dist"
     },
     "files": [
-      "src/**/*",
+      "src/main/**/*",
+      "dist-renderer/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist-renderer",
+        "to": "dist-renderer"
+      }
     ],
     "linux": {
       "target": [
@@ -69,6 +82,12 @@
       "category": "public.app-category.productivity",
       "icon": "assets/icon.icns"
     },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://cloud2.astian.org/desktop-updates"
+      }
+    ],
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
