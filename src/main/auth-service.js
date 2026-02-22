@@ -1,9 +1,11 @@
 const axios = require('axios');
+const crypto = require('crypto');
 
 class AuthService {
-    constructor(store, environmentConfig = null) {
+    constructor(store, environmentConfig = null, secureStorage = null) {
         this.store = store;
         this.environmentConfig = environmentConfig;
+        this.secureStorage = secureStorage;
         this.serverUrl = this._getServerUrl();
     }
 
@@ -19,7 +21,7 @@ class AuthService {
     }
 
     generateCode() {
-        return Math.floor(100000 + Math.random() * 900000).toString();
+        return crypto.randomInt(100000, 999999).toString();
     }
 
     getServerUrl() {
@@ -123,7 +125,7 @@ class AuthService {
     async refreshToken() {
         try {
             const serverUrl = this.getServerUrl();
-            const token = this.store.get('authToken');
+            const token = this.secureStorage ? this.secureStorage.getSecure('authToken') : this.store.get('authToken');
 
             const response = await axios.post(
                 `${serverUrl}/api/desktop/refresh-token`,
@@ -136,13 +138,17 @@ class AuthService {
             );
 
             if (response.data.success) {
-                this.store.set('authToken', response.data.token);
+                if (this.secureStorage) {
+                    this.secureStorage.setSecure('authToken', response.data.token);
+                } else {
+                    this.store.set('authToken', response.data.token);
+                }
                 return { success: true, token: response.data.token };
             }
 
             return { success: false };
         } catch (error) {
-            console.error('Error refreshing token:', error);
+            console.error('Error refreshing token:', error.message || 'Unknown error');
             return { success: false };
         }
     }
