@@ -84,8 +84,9 @@
     },
     "publish": [
       {
-        "provider": "generic",
-        "url": "https://cloud2.astian.org/desktop-updates"
+        "provider": "github",
+        "owner": "goastian",
+        "repo": "cloud-desktop-client"
       }
     ],
     "nsis": {

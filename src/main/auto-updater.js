@@ -3,8 +3,10 @@ const { app, dialog, BrowserWindow, Notification } = require('electron');
 
 /**
  * E4: Auto-update module using electron-updater.
- * Checks for updates on startup and periodically, notifies the user,
- * and installs on quit.
+ * Reads releases from GitHub: https://github.com/goastian/cloud-desktop-client
+ * electron-builder publishes artifacts to GitHub Releases; electron-updater
+ * fetches latest.yml / latest-mac.yml / latest-linux.yml from the release
+ * assets and compares versions automatically.
  */
 class AutoUpdater {
     constructor(options = {}) {
@@ -13,10 +15,18 @@ class AutoUpdater {
         this.mainWindow = null;
         this.silent = options.silent !== false; // silent by default
 
-        // Configure autoUpdater
+        // Configure autoUpdater to use GitHub Releases
         autoUpdater.autoDownload = true;
         autoUpdater.autoInstallOnAppQuit = true;
+        autoUpdater.allowPrerelease = false;
         autoUpdater.logger = console;
+
+        // Explicitly set GitHub as the update provider
+        autoUpdater.setFeedURL({
+            provider: 'github',
+            owner: 'goastian',
+            repo: 'cloud-desktop-client',
+        });
 
         this._bindEvents();
     }
