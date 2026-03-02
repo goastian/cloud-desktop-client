@@ -511,7 +511,7 @@ ipcMain.handle('verify-pairing-code', async (event, code) => {
             store.delete('pendingCode');
             store.delete('codeGeneratedAt');
             
-            return { success: true };
+            return { success: true, approved: true };
         }
         
         return result;
